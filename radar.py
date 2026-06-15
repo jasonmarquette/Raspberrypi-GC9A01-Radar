@@ -4,6 +4,7 @@ import math
 import time
 import os
 import requests
+import configparser
 from PIL import Image, ImageDraw, ImageFont
 
 
@@ -17,16 +18,45 @@ from PIL import Image, ImageDraw, ImageFont
 # USER CONFIG
 # -----------------------------
 
+# Config file path.
+CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.ini")
+
+
+def load_config():
+    config = configparser.ConfigParser()
+
+    defaults = {
+        "center_lat": "30.14705507846894",
+        "center_lon": "-95.39204791784302",
+        "range_mi": "10",
+        "refresh_seconds": "5",
+    }
+
+    config["radar"] = defaults
+    config.read(CONFIG_PATH)
+
+    radar_config = config["radar"]
+
+    return {
+        "center_lat": radar_config.getfloat("center_lat"),
+        "center_lon": radar_config.getfloat("center_lon"),
+        "range_mi": radar_config.getfloat("range_mi"),
+        "refresh_seconds": radar_config.getint("refresh_seconds"),
+    }
+
+
+APP_CONFIG = load_config()
+
 # Your selected radar center.
-CENTER_LAT = 30.14705507846894
-CENTER_LON = -95.39204791784302
+CENTER_LAT = APP_CONFIG["center_lat"]
+CENTER_LON = APP_CONFIG["center_lon"]
 
 # Radar/API range in miles.
 # Smaller range = fewer aircraft.
-RANGE_MI = 10
+RANGE_MI = APP_CONFIG["range_mi"]
 
 # Refresh rate in seconds.
-REFRESH_SECONDS = 5
+REFRESH_SECONDS = APP_CONFIG["refresh_seconds"]
 
 # Your GC9A01 display is exposed by the Pi overlay as /dev/fb0.
 FRAMEBUFFER = "/dev/fb0"
