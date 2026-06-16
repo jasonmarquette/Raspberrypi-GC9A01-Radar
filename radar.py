@@ -25,23 +25,53 @@ CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.ini")
 def load_config():
     config = configparser.ConfigParser()
 
-    defaults = {
+    radar_defaults = {
         "center_lat": "30.14705507846894",
         "center_lon": "-95.39204791784302",
         "range_mi": "10",
         "refresh_seconds": "5",
     }
 
-    config["radar"] = defaults
+    display_defaults = {
+        # Framebuffer display settings.
+        "device": "/dev/fb0",
+        "write_framebuffer": "true",
+
+        # Remote preview image settings.
+        "save_preview": "false",
+        "preview_file": "/tmp/plane-radar-preview.png",
+
+        # Aircraft heading line settings.
+        "show_heading_lines": "true",
+        "heading_line_length": "26",
+        "heading_line_gap": "7",
+        "heading_line_width": "2",
+    }
+
+    config["radar"] = radar_defaults
+    config["display"] = display_defaults
+
     config.read(CONFIG_PATH)
 
     radar_config = config["radar"]
+    display_config = config["display"]
 
     return {
         "center_lat": radar_config.getfloat("center_lat"),
         "center_lon": radar_config.getfloat("center_lon"),
         "range_mi": radar_config.getfloat("range_mi"),
         "refresh_seconds": radar_config.getint("refresh_seconds"),
+
+        "display_device": display_config.get("device"),
+        "write_framebuffer": display_config.getboolean("write_framebuffer"),
+
+        "save_preview": display_config.getboolean("save_preview"),
+        "preview_file": display_config.get("preview_file"),
+
+        "show_heading_lines": display_config.getboolean("show_heading_lines"),
+        "heading_line_length": display_config.getint("heading_line_length"),
+        "heading_line_gap": display_config.getint("heading_line_gap"),
+        "heading_line_width": display_config.getint("heading_line_width"),
     }
 
 
@@ -59,9 +89,20 @@ RANGE_MI = APP_CONFIG["range_mi"]
 REFRESH_SECONDS = APP_CONFIG["refresh_seconds"]
 
 # Your GC9A01 display is exposed by the Pi overlay as /dev/fb0.
-FRAMEBUFFER = "/dev/fb0"
+FRAMEBUFFER = APP_CONFIG["display_device"]
+WRITE_FRAMEBUFFER = APP_CONFIG["write_framebuffer"]
 
-# Temporary image path used by fbi.
+# Optional preview PNG for checking the radar image remotely.
+SAVE_PREVIEW = APP_CONFIG["save_preview"]
+PREVIEW_FILE = APP_CONFIG["preview_file"]
+
+# Aircraft heading line options.
+SHOW_HEADING_LINES = APP_CONFIG["show_heading_lines"]
+HEADING_LINE_LENGTH = APP_CONFIG["heading_line_length"]
+HEADING_LINE_GAP = APP_CONFIG["heading_line_gap"]
+HEADING_LINE_WIDTH = APP_CONFIG["heading_line_width"]
+
+# Temporary image path used by older display methods.
 IMAGE_PATH = "/tmp/plane-radar.png"
 
 
@@ -87,6 +128,7 @@ COLOR_TEXT = (220, 220, 220)
 COLOR_TEXT_DIM = (160, 210, 170)
 COLOR_OWN_SHIP = (255, 255, 255)
 COLOR_AIRCRAFT = (255, 70, 70)
+COLOR_HEADING_LINE = (180, 80, 255)
 COLOR_LABEL = (235, 235, 235)
 COLOR_WARN = (255, 190, 80)
 
@@ -238,6 +280,7 @@ def format_altitude(ac):
 
     return ""
 
+
 def get_callsign(ac):
     callsign = (
         ac.get("flight")
@@ -247,6 +290,28 @@ def get_callsign(ac):
     )
 
     return str(callsign).strip()
+
+
+def get_aircraft_heading(ac):
+    """
+    Try common ADS-B heading/track fields.
+    Returns heading in degrees, or None if unavailable.
+
+    For this display, track is usually the best field because it shows
+    where the aircraft is moving over the ground.
+    """
+    for key in ("track", "true_track", "heading", "mag_heading", "nav_heading"):
+        value = ac.get(key)
+
+        if value is None:
+            continue
+
+        try:
+            return float(value) % 360
+        except (TypeError, ValueError):
+            continue
+
+    return None
 
 
 # -----------------------------
@@ -259,6 +324,42 @@ def draw_centered_text(draw, text, center_x, y, font, fill):
     draw.text((center_x - text_width // 2, y), text, font=font, fill=fill)
 
 
+def draw_heading_line(draw, x, y, heading_deg):
+    """
+    Draw a heading line in front of the aircraft symbol.
+
+    heading_deg is degrees clockwise from north:
+    0 = north/up, 90 = east/right, 180 = south/down, 270 = west/left.
+    """
+    if not SHOW_HEADING_LINES:
+        return
+
+    if heading_deg is None:
+        return
+
+    try:
+        heading_deg = float(heading_deg)
+    except (TypeError, ValueError):
+        return
+
+    radians = math.radians(heading_deg)
+
+    dx = math.sin(radians)
+    dy = -math.cos(radians)
+
+    start_x = x + dx * HEADING_LINE_GAP
+    start_y = y + dy * HEADING_LINE_GAP
+
+    end_x = x + dx * HEADING_LINE_LENGTH
+    end_y = y + dy * HEADING_LINE_LENGTH
+
+    draw.line(
+        [(start_x, start_y), (end_x, end_y)],
+        fill=COLOR_HEADING_LINE,
+        width=HEADING_LINE_WIDTH,
+    )
+
+
 def draw_aircraft_symbol(draw, x, y, track):
     """
     Draw a small aircraft triangle. If no track is available, draw a dot.
@@ -266,6 +367,15 @@ def draw_aircraft_symbol(draw, x, y, track):
     if track is None:
         draw.ellipse((x - 3, y - 3, x + 3, y + 3), fill=COLOR_AIRCRAFT)
         return
+
+    try:
+        track = float(track)
+    except (TypeError, ValueError):
+        draw.ellipse((x - 3, y - 3, x + 3, y + 3), fill=COLOR_AIRCRAFT)
+        return
+
+    # Draw the heading line first so the aircraft triangle appears on top of it.
+    draw_heading_line(draw, x, y, track)
 
     heading = math.radians(track)
     size = 7
@@ -442,7 +552,7 @@ def draw_radar(aircraft):
         bearing = bearing_deg(CENTER_LAT, CENTER_LON, lat, lon)
         x, y = polar_to_screen(distance, bearing, RANGE_MI)
 
-        track = ac.get("track")
+        track = get_aircraft_heading(ac)
         draw_aircraft_symbol(draw, x, y, track)
 
         callsign = get_callsign(ac)
@@ -454,15 +564,6 @@ def draw_radar(aircraft):
             labeled += 1
 
         plotted += 1
-
-    # Bottom status bar.
-    status_y = HEIGHT - 24
-    draw.rectangle((0, status_y - 2, WIDTH, HEIGHT), fill=COLOR_BG)
-
-    status = f"{plotted} targets  {RANGE_MI}mi"
-    draw.text((8, status_y), status, fill=COLOR_TEXT_DIM, font=FONT_SMALL)
-
-    draw.text((WIDTH - 42, status_y), "LIVE", fill=COLOR_WARN, font=FONT_SMALL)
 
     return img, plotted
 
@@ -491,16 +592,35 @@ def image_to_rgb565_bytes(img):
     return bytes(output)
 
 
+def save_preview_image(img):
+    """
+    Save a PNG copy of the radar image so it can be copied to another computer.
+    """
+    if not SAVE_PREVIEW:
+        return
+
+    preview_dir = os.path.dirname(PREVIEW_FILE)
+
+    if preview_dir:
+        os.makedirs(preview_dir, exist_ok=True)
+
+    img.save(PREVIEW_FILE)
+
+
 def show_on_display(img):
     """
     Write the radar image directly to the Linux framebuffer.
 
     This avoids the flicker caused by repeatedly launching fbi.
     """
+    if not WRITE_FRAMEBUFFER:
+        return
+
     frame = image_to_rgb565_bytes(img)
 
     with open(FRAMEBUFFER, "wb", buffering=0) as fb:
         fb.write(frame)
+
 
 # -----------------------------
 # MAIN LOOP
@@ -511,15 +631,21 @@ def main():
     print(f"Center: {CENTER_LAT}, {CENTER_LON}")
     print(f"Range: {RANGE_MI} mi")
     print(f"Display: {FRAMEBUFFER}")
+    print(f"Write framebuffer: {WRITE_FRAMEBUFFER}")
+    print(f"Save preview: {SAVE_PREVIEW}")
+    if SAVE_PREVIEW:
+        print(f"Preview file: {PREVIEW_FILE}")
+    print(f"Heading lines: {SHOW_HEADING_LINES}")
     print("Press Ctrl+C to stop.")
 
     while True:
         aircraft = fetch_aircraft()
         img, plotted = draw_radar(aircraft)
 
-        print(f"Plotted targets: {plotted}")
-
+        save_preview_image(img)
         show_on_display(img)
+
+        print(f"Plotted targets: {plotted}")
 
         time.sleep(REFRESH_SECONDS)
 
