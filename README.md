@@ -12,8 +12,10 @@ It shows:
 
 * aircraft position relative to a fixed center point
 * aircraft heading as a small triangle with a heading line
-* callsign or registration
-* altitude on a second line under the callsign
+* aircraft label with three lines:
+  * callsign or registration in white
+  * aircraft type/designator in orange
+  * altitude in feet in blue
 * radar range rings
 * north/south/east/west markers
 * configurable radar range
@@ -187,6 +189,37 @@ Stop it with:
 Ctrl+C
 ```
 
+### Command-Line Options
+
+The script can be run with no arguments:
+
+```bash
+python radar.py
+```
+
+When run without arguments, the display mode comes from `config.ini`:
+
+```ini
+[display]
+display_type = spi
+```
+
+You can override the display mode for a single run with:
+
+```bash
+python radar.py --display spi
+python radar.py --display hdmi
+python radar.py --display preview
+```
+
+Available display modes:
+
+| Option | Description |
+| ------ | ----------- |
+| `--display spi` | Use the small GC9A01 SPI framebuffer display. |
+| `--display hdmi` | Show the radar image on an HDMI display using `fbi`. |
+| `--display preview` | Save the radar image as a PNG only. Useful for checking the output remotely. |
+
 ### Display Modes
 
 The script supports three display modes:
@@ -203,8 +236,6 @@ The default mode is set in `config.ini`:
 [display]
 display_type = spi
 ```
-
-You can override the display mode at startup with `--display`.
 
 Run on the small SPI display:
 
@@ -267,7 +298,6 @@ ls -l /dev/fb*
 
 Then update the `device` setting in `config.ini`.
 
-
 ## Configuration
 
 Radar settings are controlled by a local `config.ini` file in the project directory.
@@ -285,7 +315,7 @@ Example:
 center_lat = 30.14705507846894
 center_lon = -95.39204791784302
 range_mi = 10
-refresh_seconds = 5
+refresh_seconds = 15
 
 [display]
 display_type = spi
@@ -371,10 +401,10 @@ The refresh rate controls how often the radar fetches new aircraft data.
 Example:
 
 ```ini
-refresh_seconds = 5
+refresh_seconds = 15
 ```
 
-A lower value refreshes more often. A higher value reduces API requests and screen updates.
+A lower value refreshes more often, but may increase the chance of API rate limiting. A higher value reduces API requests and screen updates.
 
 ### Display Output
 
@@ -438,6 +468,19 @@ The API returns aircraft in the top-level JSON field:
 ```
 
 The script parses that field and plots aircraft that include latitude and longitude.
+
+The script uses these ADS-B fields when available:
+
+| Field | Used For |
+| ----- | -------- |
+| `flight` | Callsign |
+| `r` | Registration fallback |
+| `hex` | Hex identifier fallback |
+| `t` | Aircraft type/designator, such as `B738`, `A21N`, or `P28A` |
+| `alt_baro` | Barometric altitude |
+| `alt_geom` | Geometric altitude fallback |
+| `track` | Aircraft heading/track line and triangle direction |
+| `lat` / `lon` | Aircraft position |
 
 ## Auto-Start on Boot
 
@@ -623,6 +666,109 @@ cat config.ini
 
 Make sure `center_lat`, `center_lon`, and `range_mi` are correct.
 
+### API returns 429 Too Many Requests
+
+If you see an error like this:
+
+```text
+429 Client Error: Too Many Requests
+```
+
+increase the refresh interval in `config.ini`:
+
+```ini
+[radar]
+refresh_seconds = 15
+```
+
+or:
+
+```ini
+refresh_seconds = 30
+```
+
+Then restart the script.
+
+### Aircraft type is missing
+
+The aircraft type line uses the ADS-B `t` field when it is available.
+
+You can inspect the API fields with:
+
+```bash
+python - <<'PY'
+import requests
+import configparser
+
+config = configparser.ConfigParser()
+config.read("config.ini")
+
+lat = config["radar"].getfloat("center_lat")
+lon = config["radar"].getfloat("center_lon")
+dist = config["radar"].getfloat("range_mi")
+
+url = f"https://opendata.adsb.fi/api/v3/lat/{lat}/lon/{lon}/dist/{dist}"
+data = requests.get(url, timeout=8).json()
+
+for ac in data.get("ac", [])[:5]:
+    print("-" * 60)
+    print("CALLSIGN:", ac.get("flight") or ac.get("r") or ac.get("hex"))
+    print("TYPE:", ac.get("t"))
+    print("DESCRIPTION:", ac.get("desc"))
+    print("ALL KEYS:")
+    print(sorted(ac.keys()))
+PY
+```
+
+### Preview image does not update
+
+Run in preview mode:
+
+```bash
+python radar.py --display preview
+```
+
+Then check the preview file:
+
+```bash
+ls -lh /tmp/plane-radar-preview.png
+```
+
+Copy it to your Mac:
+
+```bash
+scp jason@yun:/tmp/plane-radar-preview.png ~/Downloads/
+open ~/Downloads/plane-radar-preview.png
+```
+
+### HDMI output does not show
+
+Install `fbi`:
+
+```bash
+sudo apt update
+sudo apt install -y fbi
+```
+
+Check available framebuffer devices:
+
+```bash
+ls -l /dev/fb*
+```
+
+If needed, update the framebuffer device in `config.ini`:
+
+```ini
+[display]
+device = /dev/fb0
+```
+
+Then try:
+
+```bash
+python radar.py --display hdmi
+```
+
 ### Service does not auto-start after reboot
 
 Check status:
@@ -697,5 +843,3 @@ This Raspberry Pi version was built as a proof-of-concept port using:
 * fbi for HDMI output
 * Raspberry Pi framebuffer overlay
 * opendata.adsb.fi ADS-B data
-
-jason@yun:~/plane-radar-pi $ 
