@@ -10,7 +10,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 # ============================================================
 # Plane Radar Pi - Proof of Concept
-# Raspberry Pi 4B + GC9A01 240x240 framebuffer display
+# Raspberry Pi 4B + GC9A01 240x240 + HDMI framebuffer display
 # ============================================================
 
 
@@ -512,20 +512,7 @@ def draw_radar(aircraft):
             width=1,
         )
 
-        # Ring label on lower-right part of each ring.
-        label = f"{ring_range}"
-        label_x = CENTER_X + int(rr * 0.62)
-        label_y = CENTER_Y + int(rr * 0.62) - 5
-
-        # Keep ring labels away from the bottom edge.
-        if label_y < HEIGHT - 28:
-            draw.text(
-                (label_x, label_y),
-                label,
-                fill=COLOR_TEXT_DIM,
-                font=FONT_SMALL,
-            )
-
+       
     # Crosshairs.
     draw.line(
         (CENTER_X, CENTER_Y - RADAR_RADIUS, CENTER_X, CENTER_Y + RADAR_RADIUS),
@@ -542,11 +529,21 @@ def draw_radar(aircraft):
     draw.text((WIDTH - 18, CENTER_Y - 7), "E", fill=COLOR_TEXT, font=FONT_MED)
     draw.text((7, CENTER_Y - 7), "W", fill=COLOR_TEXT, font=FONT_MED)
 
+    # Radar range label.
+    draw.text(
+        (8, HEIGHT - 17),
+        f"Range: {RANGE_MI:g} mi",
+        fill=COLOR_TEXT_DIM,
+        font=FONT_SMALL,
+    )
+    
     # Own location / center dot.
     draw.ellipse(
         (CENTER_X - 3, CENTER_Y - 3, CENTER_X + 3, CENTER_Y + 3),
         fill=COLOR_OWN_SHIP,
     )
+
+    
 
     plotted = 0
     labeled = 0
