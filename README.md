@@ -11,14 +11,14 @@ This project displays nearby aircraft on a small round TFT screen.
 It shows:
 
 * aircraft position relative to a fixed center point
-* aircraft heading as a small triangle
+* aircraft heading as a small triangle with a heading line
 * callsign or registration
 * altitude on a second line under the callsign
 * radar range rings
 * north/south/east/west markers
-* live aircraft count
 * configurable radar range
 * configurable radar center latitude and longitude
+* configurable display output: SPI framebuffer, HDMI, or preview-only PNG
 
 The current setup was built and tested on:
 
@@ -163,9 +163,9 @@ Install dependencies:
 pip install pillow requests numpy
 ```
 
-The project intentionally does not use a Python GC9A01 driver. The display is handled by the Raspberry Pi framebuffer and `fbi`.
+The project intentionally does not use a Python GC9A01 driver. In SPI mode, the display is handled by writing directly to the Raspberry Pi framebuffer. HDMI mode uses `fbi` to show the generated PNG on an HDMI display.
 
-## Main Script
+## Usage
 
 The main script is:
 
@@ -173,7 +173,7 @@ The main script is:
 ~/plane-radar-pi/radar.py
 ```
 
-Run it manually with:
+Run it manually with the default display mode from `config.ini`:
 
 ```bash
 cd ~/plane-radar-pi
@@ -186,6 +186,87 @@ Stop it with:
 ```text
 Ctrl+C
 ```
+
+### Display Modes
+
+The script supports three display modes:
+
+| Mode      | Description |
+| --------- | ----------- |
+| `spi`     | Writes directly to the small GC9A01 SPI framebuffer display. |
+| `hdmi`    | Saves a PNG and displays it on an HDMI screen using `fbi`. |
+| `preview` | Saves a PNG preview only. This is useful when checking the radar from another computer. |
+
+The default mode is set in `config.ini`:
+
+```ini
+[display]
+display_type = spi
+```
+
+You can override the display mode at startup with `--display`.
+
+Run on the small SPI display:
+
+```bash
+python radar.py --display spi
+```
+
+Run on an HDMI screen:
+
+```bash
+python radar.py --display hdmi
+```
+
+Run in preview-only mode:
+
+```bash
+python radar.py --display preview
+```
+
+### Preview Image
+
+If preview saving is enabled, the script writes a PNG copy of the radar screen to:
+
+```text
+/tmp/plane-radar-preview.png
+```
+
+Download it from another computer with:
+
+```bash
+scp jason@yun:/tmp/plane-radar-preview.png ~/Downloads/
+```
+
+On macOS, open it with:
+
+```bash
+open ~/Downloads/plane-radar-preview.png
+```
+
+### HDMI Output
+
+HDMI mode uses `fbi`, so install it first:
+
+```bash
+sudo apt update
+sudo apt install -y fbi
+```
+
+Then run:
+
+```bash
+python radar.py --display hdmi
+```
+
+If HDMI output does not appear, check which framebuffer is connected to the HDMI display:
+
+```bash
+ls -l /dev/fb*
+```
+
+Then update the `device` setting in `config.ini`.
+
 
 ## Configuration
 
@@ -205,9 +286,26 @@ center_lat = 30.14705507846894
 center_lon = -95.39204791784302
 range_mi = 10
 refresh_seconds = 5
+
+[display]
+display_type = spi
+device = /dev/fb0
+write_framebuffer = true
+
+save_preview = true
+preview_file = /tmp/plane-radar-preview.png
+
+show_heading_lines = true
+heading_line_length = 26
+heading_line_gap = 7
+heading_line_width = 2
+
+hdmi_image_file = /tmp/plane-radar-hdmi.png
+hdmi_use_sudo = false
+hdmi_tty = 1
 ```
 
-### Config Options
+### Radar Config Options
 
 | Setting           | Description                                   |
 | ----------------- | --------------------------------------------- |
@@ -215,6 +313,23 @@ refresh_seconds = 5
 | `center_lon`      | Longitude for the center of the radar display |
 | `range_mi`        | Radar/API range in statute miles              |
 | `refresh_seconds` | Number of seconds between radar refreshes     |
+
+### Display Config Options
+
+| Setting               | Description |
+| --------------------- | ----------- |
+| `display_type`        | Display mode: `spi`, `hdmi`, or `preview`. |
+| `device`              | Framebuffer device, usually `/dev/fb0`. |
+| `write_framebuffer`   | Writes raw framebuffer data in `spi` mode when set to `true`. |
+| `save_preview`        | Saves a PNG preview image when set to `true`. |
+| `preview_file`        | Path where the preview PNG is saved. |
+| `show_heading_lines`  | Shows or hides the heading line in front of each aircraft. |
+| `heading_line_length` | Length of the aircraft heading line in pixels. |
+| `heading_line_gap`    | Gap between the aircraft symbol and the start of the heading line. |
+| `heading_line_width`  | Width of the aircraft heading line in pixels. |
+| `hdmi_image_file`     | Temporary PNG used for HDMI output. |
+| `hdmi_use_sudo`       | Runs `fbi` with `sudo` in HDMI mode when set to `true`. |
+| `hdmi_tty`            | TTY number used by `fbi` for HDMI output. |
 
 ### Radar Center
 
@@ -260,6 +375,35 @@ refresh_seconds = 5
 ```
 
 A lower value refreshes more often. A higher value reduces API requests and screen updates.
+
+### Display Output
+
+The display output is controlled by:
+
+```ini
+display_type = spi
+```
+
+Use `spi` for the GC9A01 round display, `hdmi` for an HDMI screen, or `preview` when you only want to save the PNG preview.
+
+You can also override this for a single run:
+
+```bash
+python radar.py --display hdmi
+```
+
+### Aircraft Heading Lines
+
+Aircraft heading lines are controlled with:
+
+```ini
+show_heading_lines = true
+heading_line_length = 26
+heading_line_gap = 7
+heading_line_width = 2
+```
+
+Set `show_heading_lines` to `false` if you only want the aircraft triangles without the line in front.
 
 ## Display Position and Size
 
@@ -517,22 +661,20 @@ This is a proof of concept.
 
 Known limitations:
 
-* Uses `fbi` to push images to the framebuffer.
-* Refreshing may flicker slightly.
+* HDMI mode depends on `fbi`.
 * Labels can overlap when several aircraft are close together.
 * The display layout is currently designed for a 240×240 round screen.
+* HDMI output currently shows the same 240×240 radar image rather than a redesigned full-screen layout.
 * It depends on internet access and the public ADS-B API.
 
 ## Future Improvements
 
 Possible next steps:
 
-* write directly to the framebuffer instead of launching `fbi`
 * add physical buttons for range selection
-* add command-line display modes such as `--display tft` and `--display hdmi`
-* add HDMI/TV output mode
+* add a larger HDMI-optimized layout
 * improve label collision handling
-* add aircraft speed and heading
+* add aircraft speed display
 * add an airport/runway overlay
 * add Wi-Fi status indicator
 * add graceful “no aircraft found” screen
@@ -552,7 +694,8 @@ This Raspberry Pi version was built as a proof-of-concept port using:
 * GC9A01 SPI display
 * Python
 * Pillow
-* fbi
+* fbi for HDMI output
 * Raspberry Pi framebuffer overlay
 * opendata.adsb.fi ADS-B data
 
+jason@yun:~/plane-radar-pi $ 

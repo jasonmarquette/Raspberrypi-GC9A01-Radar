@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 
+import argparse
 import math
 import time
 import os
+import shutil
+import subprocess
 import requests
 import configparser
 from PIL import Image, ImageDraw, ImageFont
@@ -33,9 +36,21 @@ def load_config():
     }
 
     display_defaults = {
-        # Framebuffer display settings.
+        # display_type options:
+        #   spi     = write raw RGB565 bytes to the small SPI framebuffer
+        #   hdmi    = show the PNG on an HDMI framebuffer using fbi
+        #   preview = do not write to a display; only save the preview PNG
+        "display_type": "spi",
+
+        # Framebuffer device. For the SPI screen this is usually /dev/fb0.
+        # For HDMI it may also be /dev/fb0, depending on your Pi setup.
         "device": "/dev/fb0",
         "write_framebuffer": "true",
+
+        # HDMI/fbi display settings. Used only when display_type = hdmi.
+        "hdmi_image_file": "/tmp/plane-radar-hdmi.png",
+        "hdmi_use_sudo": "false",
+        "hdmi_tty": "1",
 
         # Remote preview image settings.
         "save_preview": "false",
@@ -62,8 +77,13 @@ def load_config():
         "range_mi": radar_config.getfloat("range_mi"),
         "refresh_seconds": radar_config.getint("refresh_seconds"),
 
+        "display_type": display_config.get("display_type").strip().lower(),
         "display_device": display_config.get("device"),
         "write_framebuffer": display_config.getboolean("write_framebuffer"),
+
+        "hdmi_image_file": display_config.get("hdmi_image_file"),
+        "hdmi_use_sudo": display_config.getboolean("hdmi_use_sudo"),
+        "hdmi_tty": display_config.get("hdmi_tty"),
 
         "save_preview": display_config.getboolean("save_preview"),
         "preview_file": display_config.get("preview_file"),
@@ -75,7 +95,36 @@ def load_config():
     }
 
 
-APP_CONFIG = load_config()
+def parse_args():
+    parser = argparse.ArgumentParser(description="Plane Radar Pi")
+
+    parser.add_argument(
+        "--display",
+        choices=("spi", "hdmi", "preview"),
+        help="Override config.ini display.display_type for this run.",
+    )
+
+    return parser.parse_args()
+
+
+def apply_cli_overrides(config):
+    args = parse_args()
+
+    if args.display:
+        config["display_type"] = args.display
+
+        # HDMI and preview modes should not write raw RGB565 bytes to the SPI screen.
+        if args.display in ("hdmi", "preview"):
+            config["write_framebuffer"] = False
+
+        # Preview mode should always save a PNG.
+        if args.display == "preview":
+            config["save_preview"] = True
+
+    return config
+
+
+APP_CONFIG = apply_cli_overrides(load_config())
 
 # Your selected radar center.
 CENTER_LAT = APP_CONFIG["center_lat"]
@@ -88,9 +137,15 @@ RANGE_MI = APP_CONFIG["range_mi"]
 # Refresh rate in seconds.
 REFRESH_SECONDS = APP_CONFIG["refresh_seconds"]
 
-# Your GC9A01 display is exposed by the Pi overlay as /dev/fb0.
+# Display mode and device.
+DISPLAY_TYPE = APP_CONFIG["display_type"]
 FRAMEBUFFER = APP_CONFIG["display_device"]
 WRITE_FRAMEBUFFER = APP_CONFIG["write_framebuffer"]
+
+# HDMI/fbi output settings.
+HDMI_IMAGE_FILE = APP_CONFIG["hdmi_image_file"]
+HDMI_USE_SUDO = APP_CONFIG["hdmi_use_sudo"]
+HDMI_TTY = APP_CONFIG["hdmi_tty"]
 
 # Optional preview PNG for checking the radar image remotely.
 SAVE_PREVIEW = APP_CONFIG["save_preview"]
@@ -592,26 +647,31 @@ def image_to_rgb565_bytes(img):
     return bytes(output)
 
 
+def save_png(img, path):
+    """
+    Save the radar image as a PNG.
+    """
+    output_dir = os.path.dirname(path)
+
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
+    img.save(path)
+
+
 def save_preview_image(img):
     """
     Save a PNG copy of the radar image so it can be copied to another computer.
     """
-    if not SAVE_PREVIEW:
-        return
-
-    preview_dir = os.path.dirname(PREVIEW_FILE)
-
-    if preview_dir:
-        os.makedirs(preview_dir, exist_ok=True)
-
-    img.save(PREVIEW_FILE)
+    if SAVE_PREVIEW:
+        save_png(img, PREVIEW_FILE)
 
 
-def show_on_display(img):
+def show_on_spi_framebuffer(img):
     """
-    Write the radar image directly to the Linux framebuffer.
+    Write the 240x240 radar image directly to the small SPI Linux framebuffer.
 
-    This avoids the flicker caused by repeatedly launching fbi.
+    This is intended for the GC9A01 SPI display using RGB565.
     """
     if not WRITE_FRAMEBUFFER:
         return
@@ -622,6 +682,60 @@ def show_on_display(img):
         fb.write(frame)
 
 
+def show_on_hdmi(img):
+    """
+    Display the radar image on an HDMI framebuffer using fbi.
+
+    Requires fbi:
+        sudo apt install fbi
+    """
+    save_png(img, HDMI_IMAGE_FILE)
+
+    fbi_path = shutil.which("fbi")
+
+    if not fbi_path:
+        print("HDMI display requested, but fbi is not installed.")
+        print("Install it with: sudo apt install fbi")
+        return
+
+    cmd = [
+        fbi_path,
+        "-T", str(HDMI_TTY),
+        "-d", FRAMEBUFFER,
+        "-a",
+        "-noverbose",
+        HDMI_IMAGE_FILE,
+    ]
+
+    if HDMI_USE_SUDO and os.geteuid() != 0:
+        cmd.insert(0, "sudo")
+
+    try:
+        subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        print("HDMI display command timed out. The preview PNG was still saved.")
+
+
+def show_on_display(img):
+    """
+    Route the radar image to the selected display output.
+    """
+    if DISPLAY_TYPE == "spi":
+        show_on_spi_framebuffer(img)
+    elif DISPLAY_TYPE == "hdmi":
+        show_on_hdmi(img)
+    elif DISPLAY_TYPE == "preview":
+        return
+    else:
+        print(f"Unknown display_type '{DISPLAY_TYPE}'. Use spi, hdmi, or preview.")
+
+
 # -----------------------------
 # MAIN LOOP
 # -----------------------------
@@ -630,11 +744,15 @@ def main():
     print("Starting Plane Radar Pi...")
     print(f"Center: {CENTER_LAT}, {CENTER_LON}")
     print(f"Range: {RANGE_MI} mi")
-    print(f"Display: {FRAMEBUFFER}")
-    print(f"Write framebuffer: {WRITE_FRAMEBUFFER}")
+    print(f"Display type: {DISPLAY_TYPE}")
+    print(f"Framebuffer device: {FRAMEBUFFER}")
+    print(f"Write raw framebuffer: {WRITE_FRAMEBUFFER}")
     print(f"Save preview: {SAVE_PREVIEW}")
     if SAVE_PREVIEW:
         print(f"Preview file: {PREVIEW_FILE}")
+    if DISPLAY_TYPE == "hdmi":
+        print(f"HDMI image file: {HDMI_IMAGE_FILE}")
+        print(f"HDMI tty: {HDMI_TTY}")
     print(f"Heading lines: {SHOW_HEADING_LINES}")
     print("Press Ctrl+C to stop.")
 
