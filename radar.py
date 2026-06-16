@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
 
-import argparse
 import math
 import time
 import os
-import shutil
-import subprocess
 import requests
 import configparser
 from PIL import Image, ImageDraw, ImageFont
@@ -36,21 +33,9 @@ def load_config():
     }
 
     display_defaults = {
-        # display_type options:
-        #   spi     = write raw RGB565 bytes to the small SPI framebuffer
-        #   hdmi    = show the PNG on an HDMI framebuffer using fbi
-        #   preview = do not write to a display; only save the preview PNG
-        "display_type": "spi",
-
-        # Framebuffer device. For the SPI screen this is usually /dev/fb0.
-        # For HDMI it may also be /dev/fb0, depending on your Pi setup.
+        # Framebuffer display settings.
         "device": "/dev/fb0",
         "write_framebuffer": "true",
-
-        # HDMI/fbi display settings. Used only when display_type = hdmi.
-        "hdmi_image_file": "/tmp/plane-radar-hdmi.png",
-        "hdmi_use_sudo": "false",
-        "hdmi_tty": "1",
 
         # Remote preview image settings.
         "save_preview": "false",
@@ -77,13 +62,8 @@ def load_config():
         "range_mi": radar_config.getfloat("range_mi"),
         "refresh_seconds": radar_config.getint("refresh_seconds"),
 
-        "display_type": display_config.get("display_type").strip().lower(),
         "display_device": display_config.get("device"),
         "write_framebuffer": display_config.getboolean("write_framebuffer"),
-
-        "hdmi_image_file": display_config.get("hdmi_image_file"),
-        "hdmi_use_sudo": display_config.getboolean("hdmi_use_sudo"),
-        "hdmi_tty": display_config.get("hdmi_tty"),
 
         "save_preview": display_config.getboolean("save_preview"),
         "preview_file": display_config.get("preview_file"),
@@ -95,36 +75,7 @@ def load_config():
     }
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Plane Radar Pi")
-
-    parser.add_argument(
-        "--display",
-        choices=("spi", "hdmi", "preview"),
-        help="Override config.ini display.display_type for this run.",
-    )
-
-    return parser.parse_args()
-
-
-def apply_cli_overrides(config):
-    args = parse_args()
-
-    if args.display:
-        config["display_type"] = args.display
-
-        # HDMI and preview modes should not write raw RGB565 bytes to the SPI screen.
-        if args.display in ("hdmi", "preview"):
-            config["write_framebuffer"] = False
-
-        # Preview mode should always save a PNG.
-        if args.display == "preview":
-            config["save_preview"] = True
-
-    return config
-
-
-APP_CONFIG = apply_cli_overrides(load_config())
+APP_CONFIG = load_config()
 
 # Your selected radar center.
 CENTER_LAT = APP_CONFIG["center_lat"]
@@ -137,15 +88,9 @@ RANGE_MI = APP_CONFIG["range_mi"]
 # Refresh rate in seconds.
 REFRESH_SECONDS = APP_CONFIG["refresh_seconds"]
 
-# Display mode and device.
-DISPLAY_TYPE = APP_CONFIG["display_type"]
+# Your GC9A01 display is exposed by the Pi overlay as /dev/fb0.
 FRAMEBUFFER = APP_CONFIG["display_device"]
 WRITE_FRAMEBUFFER = APP_CONFIG["write_framebuffer"]
-
-# HDMI/fbi output settings.
-HDMI_IMAGE_FILE = APP_CONFIG["hdmi_image_file"]
-HDMI_USE_SUDO = APP_CONFIG["hdmi_use_sudo"]
-HDMI_TTY = APP_CONFIG["hdmi_tty"]
 
 # Optional preview PNG for checking the radar image remotely.
 SAVE_PREVIEW = APP_CONFIG["save_preview"]
@@ -185,6 +130,8 @@ COLOR_OWN_SHIP = (255, 255, 255)
 COLOR_AIRCRAFT = (255, 70, 70)
 COLOR_HEADING_LINE = (180, 80, 255)
 COLOR_LABEL = (235, 235, 235)
+COLOR_TYPE = (255, 190, 80)
+COLOR_ALTITUDE = (80, 200, 255)
 COLOR_WARN = (255, 190, 80)
 
 
@@ -347,6 +294,21 @@ def get_callsign(ac):
     return str(callsign).strip()
 
 
+def get_aircraft_type(ac):
+    """
+    Return aircraft type/designator if available.
+    Examples: A319, B738, BCS3, P28A
+    """
+    aircraft_type = (
+        ac.get("t")
+        or ac.get("type")
+        or ac.get("desc")
+        or ""
+    )
+
+    return str(aircraft_type).strip()
+
+
 def get_aircraft_heading(ac):
     """
     Try common ADS-B heading/track fields.
@@ -453,23 +415,27 @@ def draw_aircraft_symbol(draw, x, y, track):
     draw.polygon([nose, left, right], fill=COLOR_AIRCRAFT)
 
 
-def draw_aircraft_label(draw, x, y, callsign, altitude, label_index):
+def draw_aircraft_label(draw, x, y, callsign, aircraft_type, altitude, label_index):
     """
-    Draw callsign on first line and altitude on second line.
+    Draw:
+    line 1 = callsign in white
+    line 2 = aircraft type in orange
+    line 3 = altitude in blue
     """
-    if not callsign and not altitude:
-        return
-
-    callsign = str(callsign).strip()[:8]
-    altitude = str(altitude).strip()
+    callsign = str(callsign).strip()[:8] if callsign else ""
+    aircraft_type = str(aircraft_type).strip()[:8] if aircraft_type else ""
+    altitude = str(altitude).strip() if altitude else ""
 
     lines = []
 
     if callsign:
-        lines.append(callsign)
+        lines.append((callsign, COLOR_LABEL))
+
+    if aircraft_type:
+        lines.append((aircraft_type, COLOR_TYPE))
 
     if altitude:
-        lines.append(altitude)
+        lines.append((altitude, COLOR_ALTITUDE))
 
     if not lines:
         return
@@ -479,15 +445,15 @@ def draw_aircraft_label(draw, x, y, callsign, altitude, label_index):
 
     text_width = 0
 
-    for line in lines:
-        bbox = draw.textbbox((0, 0), line, font=FONT_TINY)
+    for line_text, _ in lines:
+        bbox = draw.textbbox((0, 0), line_text, font=FONT_TINY)
         text_width = max(text_width, bbox[2] - bbox[0])
 
     text_height = len(lines) * line_height + (len(lines) - 1) * line_gap
 
     # Default: place label to right of aircraft.
     tx = x + 7
-    ty = y - 8
+    ty = y - 10
 
     # If near right edge, place label to left.
     if tx + text_width > WIDTH - 4:
@@ -497,20 +463,18 @@ def draw_aircraft_label(draw, x, y, callsign, altitude, label_index):
     if ty < 4:
         ty = y + 7
 
-    if ty + text_height > HEIGHT - 26:
-        ty = HEIGHT - 26 - text_height
+    if ty + text_height > HEIGHT - 6:
+        ty = HEIGHT - 6 - text_height
 
     # Slight alternating offset to reduce overlap.
     if label_index % 2 == 1:
         ty += 5
 
-    # Draw callsign first, altitude below.
-    for i, line in enumerate(lines):
-        fill = COLOR_LABEL if i == 0 else COLOR_TEXT_DIM
+    for i, (line_text, line_color) in enumerate(lines):
         draw.text(
             (tx, ty + i * (line_height + line_gap)),
-            line,
-            fill=fill,
+            line_text,
+            fill=line_color,
             font=FONT_TINY,
         )
 
@@ -611,11 +575,12 @@ def draw_radar(aircraft):
         draw_aircraft_symbol(draw, x, y, track)
 
         callsign = get_callsign(ac)
+        aircraft_type = get_aircraft_type(ac)
         altitude = format_altitude(ac)
 
         # Label only first several targets to avoid clutter.
         if labeled < 8:
-            draw_aircraft_label(draw, x, y, callsign, altitude, labeled)
+            draw_aircraft_label(draw, x, y, callsign, aircraft_type, altitude, labeled)
             labeled += 1
 
         plotted += 1
@@ -634,10 +599,15 @@ def image_to_rgb565_bytes(img):
     Most small SPI framebuffer displays on Raspberry Pi use RGB565.
     """
     img = img.convert("RGB")
+    rgb = img.tobytes()
 
     output = bytearray()
 
-    for r, g, b in img.getdata():
+    for i in range(0, len(rgb), 3):
+        r = rgb[i]
+        g = rgb[i + 1]
+        b = rgb[i + 2]
+
         value = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
 
         # Little-endian RGB565
@@ -646,32 +616,26 @@ def image_to_rgb565_bytes(img):
 
     return bytes(output)
 
-
-def save_png(img, path):
-    """
-    Save the radar image as a PNG.
-    """
-    output_dir = os.path.dirname(path)
-
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-
-    img.save(path)
-
-
 def save_preview_image(img):
     """
     Save a PNG copy of the radar image so it can be copied to another computer.
     """
-    if SAVE_PREVIEW:
-        save_png(img, PREVIEW_FILE)
+    if not SAVE_PREVIEW:
+        return
+
+    preview_dir = os.path.dirname(PREVIEW_FILE)
+
+    if preview_dir:
+        os.makedirs(preview_dir, exist_ok=True)
+
+    img.save(PREVIEW_FILE)
 
 
-def show_on_spi_framebuffer(img):
+def show_on_display(img):
     """
-    Write the 240x240 radar image directly to the small SPI Linux framebuffer.
+    Write the radar image directly to the Linux framebuffer.
 
-    This is intended for the GC9A01 SPI display using RGB565.
+    This avoids the flicker caused by repeatedly launching fbi.
     """
     if not WRITE_FRAMEBUFFER:
         return
@@ -682,60 +646,6 @@ def show_on_spi_framebuffer(img):
         fb.write(frame)
 
 
-def show_on_hdmi(img):
-    """
-    Display the radar image on an HDMI framebuffer using fbi.
-
-    Requires fbi:
-        sudo apt install fbi
-    """
-    save_png(img, HDMI_IMAGE_FILE)
-
-    fbi_path = shutil.which("fbi")
-
-    if not fbi_path:
-        print("HDMI display requested, but fbi is not installed.")
-        print("Install it with: sudo apt install fbi")
-        return
-
-    cmd = [
-        fbi_path,
-        "-T", str(HDMI_TTY),
-        "-d", FRAMEBUFFER,
-        "-a",
-        "-noverbose",
-        HDMI_IMAGE_FILE,
-    ]
-
-    if HDMI_USE_SUDO and os.geteuid() != 0:
-        cmd.insert(0, "sudo")
-
-    try:
-        subprocess.run(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=10,
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
-        print("HDMI display command timed out. The preview PNG was still saved.")
-
-
-def show_on_display(img):
-    """
-    Route the radar image to the selected display output.
-    """
-    if DISPLAY_TYPE == "spi":
-        show_on_spi_framebuffer(img)
-    elif DISPLAY_TYPE == "hdmi":
-        show_on_hdmi(img)
-    elif DISPLAY_TYPE == "preview":
-        return
-    else:
-        print(f"Unknown display_type '{DISPLAY_TYPE}'. Use spi, hdmi, or preview.")
-
-
 # -----------------------------
 # MAIN LOOP
 # -----------------------------
@@ -744,15 +654,11 @@ def main():
     print("Starting Plane Radar Pi...")
     print(f"Center: {CENTER_LAT}, {CENTER_LON}")
     print(f"Range: {RANGE_MI} mi")
-    print(f"Display type: {DISPLAY_TYPE}")
-    print(f"Framebuffer device: {FRAMEBUFFER}")
-    print(f"Write raw framebuffer: {WRITE_FRAMEBUFFER}")
+    print(f"Display: {FRAMEBUFFER}")
+    print(f"Write framebuffer: {WRITE_FRAMEBUFFER}")
     print(f"Save preview: {SAVE_PREVIEW}")
     if SAVE_PREVIEW:
         print(f"Preview file: {PREVIEW_FILE}")
-    if DISPLAY_TYPE == "hdmi":
-        print(f"HDMI image file: {HDMI_IMAGE_FILE}")
-        print(f"HDMI tty: {HDMI_TTY}")
     print(f"Heading lines: {SHOW_HEADING_LINES}")
     print("Press Ctrl+C to stop.")
 
