@@ -5,6 +5,7 @@ import time
 import os
 import requests
 import configparser
+import argparse
 from PIL import Image, ImageDraw, ImageFont
 
 
@@ -20,6 +21,22 @@ from PIL import Image, ImageDraw, ImageFont
 
 # Config file path.
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.ini")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Plane Radar Pi display")
+    parser.add_argument(
+        "--display",
+        choices=["framebuffer", "hdmi", "preview"],
+        default=None,
+        help="Display output mode. framebuffer writes to /dev/fb0, hdmi opens a fullscreen HDMI window, preview only saves preview PNG.",
+    )
+    parser.add_argument(
+        "--windowed",
+        action="store_true",
+        help="Use a normal resizable HDMI window instead of fullscreen. Only used with --display hdmi.",
+    )
+    return parser.parse_args()
 
 
 def load_config():
@@ -76,6 +93,11 @@ def load_config():
 
 
 APP_CONFIG = load_config()
+ARGS = parse_args()
+
+DISPLAY_MODE = ARGS.display
+if DISPLAY_MODE is None:
+    DISPLAY_MODE = "framebuffer" if APP_CONFIG["write_framebuffer"] else "preview"
 
 # Your selected radar center.
 CENTER_LAT = APP_CONFIG["center_lat"]
@@ -90,7 +112,7 @@ REFRESH_SECONDS = APP_CONFIG["refresh_seconds"]
 
 # Your GC9A01 display is exposed by the Pi overlay as /dev/fb0.
 FRAMEBUFFER = APP_CONFIG["display_device"]
-WRITE_FRAMEBUFFER = APP_CONFIG["write_framebuffer"]
+WRITE_FRAMEBUFFER = APP_CONFIG["write_framebuffer"] and DISPLAY_MODE == "framebuffer"
 
 # Optional preview PNG for checking the radar image remotely.
 SAVE_PREVIEW = APP_CONFIG["save_preview"]
@@ -589,6 +611,64 @@ def draw_radar(aircraft):
 # DISPLAY OUTPUT
 # -----------------------------
 
+def init_hdmi_display():
+    """
+    Open the active HDMI desktop display using pygame.
+    This is only used when launched with --display hdmi.
+    """
+    if DISPLAY_MODE != "hdmi":
+        return None
+
+    try:
+        import pygame
+    except ImportError as exc:
+        raise SystemExit(
+            "pygame is required for HDMI mode. Install it with: sudo apt install python3-pygame"
+        ) from exc
+
+    pygame.init()
+    pygame.display.set_caption("Plane Radar Pi")
+    pygame.mouse.set_visible(False)
+
+    if ARGS.windowed:
+        screen = pygame.display.set_mode((960, 960), pygame.RESIZABLE)
+    else:
+        screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+
+    return pygame, screen
+
+
+def show_on_hdmi(img, hdmi):
+    """
+    Show the Pillow radar image on the HDMI desktop.
+    The 240x240 radar is scaled up to the largest square that fits.
+    """
+    if DISPLAY_MODE != "hdmi" or hdmi is None:
+        return False
+
+    pygame, screen = hdmi
+
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT:
+            raise KeyboardInterrupt
+        if event.type == pygame.KEYDOWN and event.key in (pygame.K_ESCAPE, pygame.K_q):
+            raise KeyboardInterrupt
+
+    screen_width, screen_height = screen.get_size()
+    scale_size = min(screen_width, screen_height)
+
+    surface = pygame.image.fromstring(img.convert("RGB").tobytes(), img.size, "RGB")
+    surface = pygame.transform.smoothscale(surface, (scale_size, scale_size))
+
+    screen.fill(COLOR_BG)
+    x = (screen_width - scale_size) // 2
+    y = (screen_height - scale_size) // 2
+    screen.blit(surface, (x, y))
+    pygame.display.flip()
+
+    return True
+
+
 def image_to_rgb565_bytes(img):
     """
     Convert a Pillow RGB image to RGB565 little-endian bytes.
@@ -651,19 +731,23 @@ def main():
     print("Starting Plane Radar Pi...")
     print(f"Center: {CENTER_LAT}, {CENTER_LON}")
     print(f"Range: {RANGE_MI} mi")
-    print(f"Display: {FRAMEBUFFER}")
+    print(f"Display mode: {DISPLAY_MODE}")
+    print(f"Framebuffer device: {FRAMEBUFFER}")
     print(f"Write framebuffer: {WRITE_FRAMEBUFFER}")
     print(f"Save preview: {SAVE_PREVIEW}")
     if SAVE_PREVIEW:
         print(f"Preview file: {PREVIEW_FILE}")
     print(f"Heading lines: {SHOW_HEADING_LINES}")
-    print("Press Ctrl+C to stop.")
+    print("Press Ctrl+C to stop. Press Esc or q to quit HDMI mode.")
+
+    hdmi = init_hdmi_display()
 
     while True:
         aircraft = fetch_aircraft()
         img, plotted = draw_radar(aircraft)
 
         save_preview_image(img)
+        show_on_hdmi(img, hdmi)
         show_on_display(img)
 
         print(f"Plotted targets: {plotted}")
