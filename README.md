@@ -1,5 +1,7 @@
 # Plane Radar Pi
 
+![Plane Radar Pi running on HDMI display](images/pi-screen.jpeg)
+
 A Raspberry Pi ADS-B radar display that shows nearby aircraft on an HDMI screen.
 
 This project started as a Raspberry Pi 4B proof-of-concept port of an ESP32 live ADS-B plane radar project. The current `radar.py` has been optimized for HDMI output and is intended to run fullscreen on the Raspberry Pi desktop.
