@@ -1,40 +1,36 @@
 #!/usr/bin/env python3
 
-import math
-import time
-import os
-import requests
-import configparser
 import argparse
+import configparser
+import math
+import os
+import socket
+import time
+
+import requests
 from PIL import Image, ImageDraw, ImageFont
 
 
 # ============================================================
-# Plane Radar Pi - Proof of Concept
-# Raspberry Pi 4B + GC9A01 240x240 + HDMI framebuffer display
+# Plane Radar Pi - HDMI Edition
+# Raspberry Pi HDMI fullscreen radar with right-side status panel
 # ============================================================
 
-
-# -----------------------------
-# USER CONFIG
-# -----------------------------
-
-# Config file path.
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.ini")
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Plane Radar Pi display")
+    parser = argparse.ArgumentParser(description="Plane Radar Pi HDMI display")
     parser.add_argument(
         "--display",
-        choices=["framebuffer", "hdmi", "preview"],
-        default=None,
-        help="Display output mode. framebuffer writes to /dev/fb0, hdmi opens a fullscreen HDMI window, preview only saves preview PNG.",
+        choices=["hdmi"],
+        default="hdmi",
+        help="Display output mode. This HDMI-optimized version only supports hdmi.",
     )
     parser.add_argument(
         "--windowed",
         action="store_true",
-        help="Use a normal resizable HDMI window instead of fullscreen. Only used with --display hdmi.",
+        help="Use a normal resizable window instead of fullscreen.",
     )
     return parser.parse_args()
 
@@ -42,31 +38,22 @@ def parse_args():
 def load_config():
     config = configparser.ConfigParser()
 
-    radar_defaults = {
+    config["radar"] = {
         "center_lat": "30.14705507846894",
         "center_lon": "-95.39204791784302",
         "range_mi": "10",
-        "refresh_seconds": "5",
+        "refresh_seconds": "1",
+        "api_poll_seconds": "15",
     }
 
-    display_defaults = {
-        # Framebuffer display settings.
-        "device": "/dev/fb0",
-        "write_framebuffer": "true",
-
-        # Remote preview image settings.
+    config["display"] = {
         "save_preview": "false",
         "preview_file": "/tmp/plane-radar-preview.png",
-
-        # Aircraft heading line settings.
         "show_heading_lines": "true",
         "heading_line_length": "26",
         "heading_line_gap": "7",
         "heading_line_width": "2",
     }
-
-    config["radar"] = radar_defaults
-    config["display"] = display_defaults
 
     config.read(CONFIG_PATH)
 
@@ -77,14 +64,12 @@ def load_config():
         "center_lat": radar_config.getfloat("center_lat"),
         "center_lon": radar_config.getfloat("center_lon"),
         "range_mi": radar_config.getfloat("range_mi"),
-        "refresh_seconds": radar_config.getint("refresh_seconds"),
-
-        "display_device": display_config.get("device"),
-        "write_framebuffer": display_config.getboolean("write_framebuffer"),
-
+        # refresh_seconds is now the screen redraw interval.
+        # api_poll_seconds controls how often the ADS-B API is called.
+        "refresh_seconds": max(1, radar_config.getint("refresh_seconds", fallback=1)),
+        "api_poll_seconds": max(15, radar_config.getint("api_poll_seconds", fallback=radar_config.getint("refresh_seconds", fallback=15))),
         "save_preview": display_config.getboolean("save_preview"),
         "preview_file": display_config.get("preview_file"),
-
         "show_heading_lines": display_config.getboolean("show_heading_lines"),
         "heading_line_length": display_config.getint("heading_line_length"),
         "heading_line_gap": display_config.getint("heading_line_gap"),
@@ -92,70 +77,56 @@ def load_config():
     }
 
 
-APP_CONFIG = load_config()
 ARGS = parse_args()
+APP_CONFIG = load_config()
 
-DISPLAY_MODE = ARGS.display
-if DISPLAY_MODE is None:
-    DISPLAY_MODE = "framebuffer" if APP_CONFIG["write_framebuffer"] else "preview"
-
-# Your selected radar center.
 CENTER_LAT = APP_CONFIG["center_lat"]
 CENTER_LON = APP_CONFIG["center_lon"]
-
-# Radar/API range in miles.
-# Smaller range = fewer aircraft.
 RANGE_MI = APP_CONFIG["range_mi"]
-
-# Refresh rate in seconds.
 REFRESH_SECONDS = APP_CONFIG["refresh_seconds"]
-
-# Your GC9A01 display is exposed by the Pi overlay as /dev/fb0.
-FRAMEBUFFER = APP_CONFIG["display_device"]
-WRITE_FRAMEBUFFER = APP_CONFIG["write_framebuffer"] and DISPLAY_MODE == "framebuffer"
-
-# Optional preview PNG for checking the radar image remotely.
+API_POLL_SECONDS = APP_CONFIG["api_poll_seconds"]
 SAVE_PREVIEW = APP_CONFIG["save_preview"]
 PREVIEW_FILE = APP_CONFIG["preview_file"]
-
-# Aircraft heading line options.
 SHOW_HEADING_LINES = APP_CONFIG["show_heading_lines"]
 HEADING_LINE_LENGTH = APP_CONFIG["heading_line_length"]
 HEADING_LINE_GAP = APP_CONFIG["heading_line_gap"]
 HEADING_LINE_WIDTH = APP_CONFIG["heading_line_width"]
-
-# Temporary image path used by older display methods.
-IMAGE_PATH = "/tmp/plane-radar.png"
 
 
 # -----------------------------
 # DISPLAY LAYOUT
 # -----------------------------
 
-WIDTH = 240
-HEIGHT = 240
+WIDTH = 1920
+HEIGHT = 1080
 DRAW_SCALE = 1.0
 
-# Move radar slightly up to avoid bottom clipping on the round SPI display.
-CENTER_X = WIDTH // 2
-CENTER_Y = (HEIGHT // 2) - 4
+MARGIN = 28
+RADAR_LEFT = MARGIN
+RADAR_TOP = MARGIN
+RADAR_SIZE = 1024
+CENTER_X = RADAR_LEFT + RADAR_SIZE // 2
+CENTER_Y = RADAR_TOP + RADAR_SIZE // 2
+RADAR_RADIUS = RADAR_SIZE // 2 - 34
+SIDEBAR_X = RADAR_LEFT + RADAR_SIZE + MARGIN
+SIDEBAR_W = WIDTH - SIDEBAR_X - MARGIN
 
-# Smaller radar circle to fit safely on round display.
-RADAR_RADIUS = 112
-
-# Colors
 COLOR_BG = (2, 8, 20)
-COLOR_RING_MAJOR = (0, 180, 90)
-COLOR_RING_MINOR = (0, 80, 60)
-COLOR_TEXT = (220, 220, 220)
-COLOR_TEXT_DIM = (160, 210, 170)
+COLOR_PANEL_BG = (6, 17, 34)
+COLOR_PANEL_LINE = (0, 115, 95)
+COLOR_RING_MAJOR = (0, 210, 105)
+COLOR_RING_MINOR = (0, 105, 75)
+COLOR_TEXT = (225, 235, 235)
+COLOR_TEXT_DIM = (155, 210, 175)
 COLOR_OWN_SHIP = (255, 255, 255)
 COLOR_AIRCRAFT = (255, 70, 70)
 COLOR_HEADING_LINE = (180, 80, 255)
-COLOR_LABEL = (235, 235, 235)
+COLOR_LABEL = (245, 245, 245)
 COLOR_TYPE = (255, 190, 80)
-COLOR_ALTITUDE = (80, 200, 255)
+COLOR_ALTITUDE = (80, 205, 255)
 COLOR_WARN = (255, 190, 80)
+COLOR_OK = (85, 235, 145)
+COLOR_CACHED = (255, 190, 80)
 
 
 # -----------------------------
@@ -164,10 +135,8 @@ COLOR_WARN = (255, 190, 80)
 
 def load_font(size, bold=False):
     paths = []
-
     if bold:
         paths.append("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf")
-
     paths.extend([
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
@@ -182,46 +151,58 @@ def load_font(size, bold=False):
     return ImageFont.load_default()
 
 
-# Font objects are initialized by configure_layout().
-FONT_TINY = load_font(10)
-FONT_SMALL = load_font(10)
-FONT_MED = load_font(12)
-FONT_BOLD = load_font(12, bold=True)
+FONT_TINY = load_font(22)
+FONT_SMALL = load_font(26)
+FONT_MED = load_font(34)
+FONT_BOLD = load_font(34, bold=True)
+FONT_TITLE = load_font(54)
+FONT_VALUE = load_font(52, bold=True)
+FONT_LABEL_PANEL = load_font(24, bold=True)
+FONT_PANEL = load_font(28)
 
 
 def scaled(value, minimum=1):
     return max(minimum, int(round(value * DRAW_SCALE)))
 
 
-def configure_layout(width=240, height=240, mode="framebuffer"):
-    """
-    Configure drawing size.
-
-    Framebuffer mode renders the original 240x240 image for the GC9A01.
-    HDMI mode renders at the HDMI window/screen size instead of drawing 240x240
-    and scaling it up. This removes the pixelated look.
-    """
-    global WIDTH, HEIGHT, DRAW_SCALE, CENTER_X, CENTER_Y, RADAR_RADIUS
-    global FONT_TINY, FONT_SMALL, FONT_MED, FONT_BOLD
+def configure_layout(width, height):
+    global WIDTH, HEIGHT, DRAW_SCALE
+    global MARGIN, RADAR_LEFT, RADAR_TOP, RADAR_SIZE, CENTER_X, CENTER_Y, RADAR_RADIUS
+    global SIDEBAR_X, SIDEBAR_W
+    global FONT_TINY, FONT_SMALL, FONT_MED, FONT_BOLD, FONT_TITLE, FONT_VALUE, FONT_LABEL_PANEL, FONT_PANEL
 
     WIDTH = int(width)
     HEIGHT = int(height)
-    DRAW_SCALE = min(WIDTH, HEIGHT) / 240.0
+    DRAW_SCALE = min(WIDTH, HEIGHT) / 1080.0
+    MARGIN = scaled(28)
 
-    CENTER_X = WIDTH // 2
+    # Keep the radar large and crisp, but reserve a dedicated right-hand panel.
+    preferred_sidebar = max(scaled(380), int(WIDTH * 0.30))
+    RADAR_SIZE = min(HEIGHT - (MARGIN * 2), WIDTH - preferred_sidebar - (MARGIN * 3))
 
-    if mode == "framebuffer":
-        CENTER_Y = (HEIGHT // 2) - scaled(4, 0)
-        RADAR_RADIUS = min(WIDTH, HEIGHT) // 2 - scaled(8)
-    else:
-        CENTER_Y = HEIGHT // 2
-        RADAR_RADIUS = min(WIDTH, HEIGHT) // 2 - scaled(36)
+    # Fallback for smaller displays/windowed testing.
+    if RADAR_SIZE < scaled(420):
+        RADAR_SIZE = min(HEIGHT - (MARGIN * 2), WIDTH - (MARGIN * 2))
+        preferred_sidebar = 0
 
-    # Scale fonts for HDMI so text is sharp instead of enlarged from 240px.
-    FONT_TINY = load_font(scaled(10, 8))
-    FONT_SMALL = load_font(scaled(10, 8))
-    FONT_MED = load_font(scaled(12, 9))
-    FONT_BOLD = load_font(scaled(12, 9), bold=True)
+    RADAR_LEFT = MARGIN
+    RADAR_TOP = (HEIGHT - RADAR_SIZE) // 2
+    CENTER_X = RADAR_LEFT + RADAR_SIZE // 2
+    CENTER_Y = RADAR_TOP + RADAR_SIZE // 2
+    RADAR_RADIUS = RADAR_SIZE // 2 - scaled(38)
+
+    SIDEBAR_X = RADAR_LEFT + RADAR_SIZE + MARGIN
+    SIDEBAR_W = max(0, WIDTH - SIDEBAR_X - MARGIN)
+
+    # Font sizes are based on screen height so 720p/1080p/4K all stay proportional.
+    FONT_TINY = load_font(scaled(18, 12))
+    FONT_SMALL = load_font(scaled(22, 14))
+    FONT_MED = load_font(scaled(28, 18))
+    FONT_BOLD = load_font(scaled(30, 18), bold=True)
+    FONT_TITLE = load_font(scaled(54, 28))
+    FONT_VALUE = load_font(scaled(52, 26), bold=True)
+    FONT_LABEL_PANEL = load_font(scaled(23, 14), bold=True)
+    FONT_PANEL = load_font(scaled(27, 16))
 
 
 # -----------------------------
@@ -229,56 +210,31 @@ def configure_layout(width=240, height=240, mode="framebuffer"):
 # -----------------------------
 
 def haversine_mi(lat1, lon1, lat2, lon2):
-    """
-    Distance between two lat/lon points in statute miles.
-    """
     earth_radius_mi = 3958.8
-
     p1 = math.radians(lat1)
     p2 = math.radians(lat2)
     dp = math.radians(lat2 - lat1)
     dl = math.radians(lon2 - lon1)
-
-    a = (
-        math.sin(dp / 2) ** 2
-        + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
-    )
-
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return earth_radius_mi * c
 
 
 def bearing_deg(lat1, lon1, lat2, lon2):
-    """
-    Bearing from point 1 to point 2.
-    0 degrees = north, 90 = east.
-    """
     p1 = math.radians(lat1)
     p2 = math.radians(lat2)
     dl = math.radians(lon2 - lon1)
-
     y = math.sin(dl) * math.cos(p2)
-    x = (
-        math.cos(p1) * math.sin(p2)
-        - math.sin(p1) * math.cos(p2) * math.cos(dl)
-    )
-
-    bearing = math.degrees(math.atan2(y, x))
-    return (bearing + 360) % 360
+    x = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dl)
+    return (math.degrees(math.atan2(y, x)) + 360) % 360
 
 
 def polar_to_screen(distance_mi, bearing, max_range_mi):
-    """
-    Convert distance/bearing into x/y screen position.
-    """
     scale = min(distance_mi / max_range_mi, 1.0)
     radius = scale * RADAR_RADIUS
-
     angle = math.radians(bearing)
-
     x = CENTER_X + math.sin(angle) * radius
     y = CENTER_Y - math.cos(angle) * radius
-
     return int(x), int(y)
 
 
@@ -288,56 +244,50 @@ def polar_to_screen(distance_mi, bearing, max_range_mi):
 
 def fetch_aircraft():
     """
-    Fetch aircraft near the configured location.
-
-    opendata.adsb.fi returns aircraft in the top-level "ac" array.
+    Fetch aircraft once.
 
     Returns:
-        list[dict] on success.
-        None on temporary failure, such as HTTP 429 rate limiting.
+        {
+            "ok": bool,
+            "aircraft": list | None,
+            "retry_after": int | None,
+            "message": str,
+        }
 
-    Returning None lets the main loop keep showing the last good
-    aircraft list instead of blanking the radar screen.
+    Important: this function is only called by the scheduler in main(),
+    not every screen redraw. That prevents accidental API hammering.
     """
-    url = (
-        f"https://opendata.adsb.fi/api/v3/lat/{CENTER_LAT}/"
-        f"lon/{CENTER_LON}/dist/{RANGE_MI}"
-    )
+    url = f"https://opendata.adsb.fi/api/v3/lat/{CENTER_LAT}/lon/{CENTER_LON}/dist/{RANGE_MI}"
 
     try:
         response = requests.get(url, timeout=8)
 
         if response.status_code == 429:
-            retry_after = response.headers.get("Retry-After")
+            retry_after = None
+            retry_after_header = response.headers.get("Retry-After")
+            if retry_after_header:
+                try:
+                    retry_after = int(float(retry_after_header))
+                except ValueError:
+                    retry_after = None
 
+            message = "429 Too Many Requests"
             if retry_after:
-                print(
-                    "ADS-B fetch rate limited: 429 Too Many Requests "
-                    f"| Retry-After: {retry_after}s | keeping last good data"
-                )
-            else:
-                print(
-                    "ADS-B fetch rate limited: 429 Too Many Requests "
-                    "| keeping last good data"
-                )
+                message += f" | Retry-After: {retry_after}s"
 
-            return None
+            print(f"ADS-B fetch rate limited: {message} | keeping last good data")
+            return {"ok": False, "aircraft": None, "retry_after": retry_after, "message": message}
 
         response.raise_for_status()
         data = response.json()
-
         aircraft = data.get("ac", [])
-
-        print(
-            f"API aircraft: {len(aircraft)} | "
-            f"API total: {data.get('total', 'n/a')}"
-        )
-
-        return aircraft
+        print(f"API aircraft: {len(aircraft)} | API total: {data.get('total', 'n/a')}")
+        return {"ok": True, "aircraft": aircraft, "retry_after": None, "message": "OK"}
 
     except Exception as e:
-        print(f"ADS-B fetch failed: {e} | keeping last good data")
-        return None
+        message = str(e)
+        print(f"ADS-B fetch failed: {message} | keeping last good data")
+        return {"ok": False, "aircraft": None, "retry_after": None, "message": message}
 
 
 # -----------------------------
@@ -345,72 +295,55 @@ def fetch_aircraft():
 # -----------------------------
 
 def format_altitude(ac):
-    """
-    Format altitude in feet.
-
-    Example:
-    2500 ft -> 2500 ft
-    """
     alt = ac.get("alt_baro")
-
     if alt is None or alt == "ground":
         alt = ac.get("alt_geom")
-
     if alt == "ground":
         return "GND"
-
-    if isinstance(alt, int) or isinstance(alt, float):
+    if isinstance(alt, (int, float)):
         return f"{int(round(alt))} ft"
-
     return ""
 
 
 def get_callsign(ac):
-    callsign = (
-        ac.get("flight")
-        or ac.get("r")
-        or ac.get("hex")
-        or ""
-    )
-
-    return str(callsign).strip()
+    return str(ac.get("flight") or ac.get("r") or ac.get("hex") or "").strip()
 
 
 def get_aircraft_type(ac):
-    """
-    Return aircraft type/designator if available.
-    Examples: A319, B738, BCS3, P28A
-    """
-    aircraft_type = (
-        ac.get("t")
-        or ac.get("type")
-        or ac.get("desc")
-        or ""
-    )
-
-    return str(aircraft_type).strip()
+    return str(ac.get("t") or ac.get("type") or ac.get("desc") or "").strip()
 
 
 def get_aircraft_heading(ac):
-    """
-    Try common ADS-B heading/track fields.
-    Returns heading in degrees, or None if unavailable.
-
-    For this display, track is usually the best field because it shows
-    where the aircraft is moving over the ground.
-    """
     for key in ("track", "true_track", "heading", "mag_heading", "nav_heading"):
         value = ac.get(key)
-
         if value is None:
             continue
-
         try:
             return float(value) % 360
         except (TypeError, ValueError):
             continue
-
     return None
+
+
+_LOCAL_IP_CACHE = {"value": None, "time": 0}
+
+
+def get_local_ip():
+    # Do not do a network socket check every frame. Cache it for 60 seconds.
+    now = time.time()
+    if _LOCAL_IP_CACHE["value"] is not None and now - _LOCAL_IP_CACHE["time"] < 60:
+        return _LOCAL_IP_CACHE["value"]
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            value = s.getsockname()[0]
+    except Exception:
+        value = "unknown"
+
+    _LOCAL_IP_CACHE["value"] = value
+    _LOCAL_IP_CACHE["time"] = now
+    return value
 
 
 # -----------------------------
@@ -424,49 +357,28 @@ def draw_centered_text(draw, text, center_x, y, font, fill):
 
 
 def draw_heading_line(draw, x, y, heading_deg):
-    """
-    Draw a heading line in front of the aircraft symbol.
-
-    heading_deg is degrees clockwise from north:
-    0 = north/up, 90 = east/right, 180 = south/down, 270 = west/left.
-    """
-    if not SHOW_HEADING_LINES:
+    if not SHOW_HEADING_LINES or heading_deg is None:
         return
-
-    if heading_deg is None:
-        return
-
     try:
         heading_deg = float(heading_deg)
     except (TypeError, ValueError):
         return
 
     radians = math.radians(heading_deg)
-
     dx = math.sin(radians)
     dy = -math.cos(radians)
-
     gap = scaled(HEADING_LINE_GAP)
     length = scaled(HEADING_LINE_LENGTH)
 
-    start_x = x + dx * gap
-    start_y = y + dy * gap
-
-    end_x = x + dx * length
-    end_y = y + dy * length
-
     draw.line(
-        [(start_x, start_y), (end_x, end_y)],
+        [(x + dx * gap, y + dy * gap), (x + dx * length, y + dy * length)],
         fill=COLOR_HEADING_LINE,
         width=scaled(HEADING_LINE_WIDTH),
     )
 
 
 def draw_aircraft_symbol(draw, x, y, track):
-    """
-    Draw a small aircraft triangle. If no track is available, draw a dot.
-    """
-    dot_radius = scaled(3)
+    dot_radius = scaled(4)
 
     if track is None:
         draw.ellipse((x - dot_radius, y - dot_radius, x + dot_radius, y + dot_radius), fill=COLOR_AIRCRAFT)
@@ -478,159 +390,163 @@ def draw_aircraft_symbol(draw, x, y, track):
         draw.ellipse((x - dot_radius, y - dot_radius, x + dot_radius, y + dot_radius), fill=COLOR_AIRCRAFT)
         return
 
-    # Draw the heading line first so the aircraft triangle appears on top of it.
     draw_heading_line(draw, x, y, track)
 
     heading = math.radians(track)
-    size = scaled(7)
-
-    nose = (
-        int(x + math.sin(heading) * size),
-        int(y - math.cos(heading) * size),
-    )
-
-    left = (
-        int(x + math.sin(heading + 2.4) * size),
-        int(y - math.cos(heading + 2.4) * size),
-    )
-
-    right = (
-        int(x + math.sin(heading - 2.4) * size),
-        int(y - math.cos(heading - 2.4) * size),
-    )
-
+    size = scaled(10)
+    nose = (int(x + math.sin(heading) * size), int(y - math.cos(heading) * size))
+    left = (int(x + math.sin(heading + 2.4) * size), int(y - math.cos(heading + 2.4) * size))
+    right = (int(x + math.sin(heading - 2.4) * size), int(y - math.cos(heading - 2.4) * size))
     draw.polygon([nose, left, right], fill=COLOR_AIRCRAFT)
 
 
 def draw_aircraft_label(draw, x, y, callsign, aircraft_type, altitude, label_index):
-    """
-    Draw:
-    line 1 = callsign in white
-    line 2 = aircraft type in orange
-    line 3 = altitude in blue
-    """
     callsign = str(callsign).strip()[:8] if callsign else ""
     aircraft_type = str(aircraft_type).strip()[:8] if aircraft_type else ""
     altitude = str(altitude).strip() if altitude else ""
 
     lines = []
-
     if callsign:
         lines.append((callsign, COLOR_LABEL))
-
     if aircraft_type:
         lines.append((aircraft_type, COLOR_TYPE))
-
     if altitude:
         lines.append((altitude, COLOR_ALTITUDE))
-
     if not lines:
         return
 
-    line_gap = scaled(1)
-    line_height = scaled(11)
-
+    line_gap = scaled(2)
+    line_height = scaled(22)
     text_width = 0
-
     for line_text, _ in lines:
         bbox = draw.textbbox((0, 0), line_text, font=FONT_TINY)
         text_width = max(text_width, bbox[2] - bbox[0])
 
     text_height = len(lines) * line_height + (len(lines) - 1) * line_gap
+    tx = x + scaled(12)
+    ty = y - scaled(18)
 
-    # Default: place label to right of aircraft.
-    tx = x + scaled(7)
-    ty = y - scaled(10)
+    radar_right = RADAR_LEFT + RADAR_SIZE
+    radar_bottom = RADAR_TOP + RADAR_SIZE
 
-    # If near right edge, place label to left.
-    if tx + text_width > WIDTH - scaled(4):
-        tx = x - text_width - scaled(7)
-
-    # Keep inside top/bottom safe area.
-    if ty < scaled(4):
-        ty = y + scaled(7)
-
-    if ty + text_height > HEIGHT - scaled(6):
-        ty = HEIGHT - scaled(6) - text_height
-
-    # Slight alternating offset to reduce overlap.
+    if tx + text_width > radar_right - scaled(8):
+        tx = x - text_width - scaled(12)
+    if ty < RADAR_TOP + scaled(8):
+        ty = y + scaled(12)
+    if ty + text_height > radar_bottom - scaled(8):
+        ty = radar_bottom - scaled(8) - text_height
     if label_index % 2 == 1:
-        ty += scaled(5)
+        ty += scaled(9)
 
     for i, (line_text, line_color) in enumerate(lines):
-        draw.text(
-            (tx, ty + i * (line_height + line_gap)),
-            line_text,
-            fill=line_color,
-            font=FONT_TINY,
-        )
+        draw.text((tx, ty + i * (line_height + line_gap)), line_text, fill=line_color, font=FONT_TINY)
+
+
+def panel_text(draw, x, y, label, value, value_color=COLOR_TEXT, small_value=False):
+    draw.text((x, y), label.upper(), font=FONT_LABEL_PANEL, fill=COLOR_TEXT_DIM)
+    value_font = FONT_PANEL if small_value else FONT_VALUE
+    draw.text((x, y + scaled(28)), str(value), font=value_font, fill=value_color)
+    return y + (scaled(88) if small_value else scaled(110))
+
+
+def draw_sidebar(draw, plotted, api_count, api_status, cache_age_seconds, last_update_time):
+    if SIDEBAR_W <= scaled(260):
+        return
+
+    panel_left = SIDEBAR_X
+    panel_right = WIDTH - MARGIN
+    panel_top = RADAR_TOP
+    panel_bottom = RADAR_TOP + RADAR_SIZE
+
+    draw.rectangle((panel_left, panel_top, panel_right, panel_bottom), fill=COLOR_PANEL_BG)
+    draw.line((panel_left, panel_top, panel_left, panel_bottom), fill=COLOR_PANEL_LINE, width=scaled(2))
+
+    x = panel_left + scaled(34)
+    y = panel_top + scaled(36)
+
+    draw.text((x, y), "Plane", font=FONT_TITLE, fill=COLOR_TEXT)
+    draw.text((x, y + scaled(60)), "Radar", font=FONT_TITLE, fill=COLOR_TEXT)
+    y += scaled(140)
+    draw.line((x, y, panel_right - scaled(28), y), fill=COLOR_PANEL_LINE, width=scaled(1))
+    y += scaled(24)
+
+    y = panel_text(draw, x, y, "Aircraft", plotted)
+
+    range_km = RANGE_MI * 1.60934
+    range_text = f"{RANGE_MI:g} mi / {range_km:.0f} km"
+    y = panel_text(draw, x, y, "Range", range_text, small_value=True)
+
+    ip_addr = get_local_ip()
+    wifi_value = "CONNECTED" if ip_addr != "unknown" else "UNKNOWN"
+    y = panel_text(draw, x, y, "Network", wifi_value, COLOR_OK if ip_addr != "unknown" else COLOR_WARN, small_value=True)
+    draw.text((x, y - scaled(36)), ip_addr, font=FONT_PANEL, fill=COLOR_TEXT)
+    y += scaled(14)
+
+    y = panel_text(draw, x, y, "Lat", f"{CENTER_LAT:.4f}", small_value=True)
+    y = panel_text(draw, x, y, "Lon", f"{CENTER_LON:.4f}", small_value=True)
+
+    # Keep status near the bottom of the panel.
+    status_y = max(y, panel_bottom - scaled(180))
+    draw.line((x, status_y - scaled(18), panel_right - scaled(28), status_y - scaled(18)), fill=COLOR_PANEL_LINE, width=scaled(1))
+
+    if api_status == "live":
+        status_text = "LIVE"
+        status_color = COLOR_OK
+    elif api_status == "cached":
+        status_text = f"CACHED {cache_age_seconds}s" if cache_age_seconds is not None else "CACHED"
+        status_color = COLOR_CACHED
+    else:
+        status_text = "WAITING"
+        status_color = COLOR_WARN
+
+    draw.text((x, status_y), "API", font=FONT_LABEL_PANEL, fill=COLOR_TEXT_DIM)
+    draw.text((x, status_y + scaled(30)), status_text, font=FONT_PANEL, fill=status_color)
+
+    if last_update_time is not None:
+        updated = time.strftime("%H:%M:%S", time.localtime(last_update_time))
+        draw.text((x, status_y + scaled(70)), f"Updated {updated}", font=FONT_PANEL, fill=COLOR_TEXT)
+
+    draw.text((x, panel_bottom - scaled(40)), f"API poll {API_POLL_SECONDS}s | API {api_count}", font=FONT_SMALL, fill=COLOR_TEXT_DIM)
 
 
 # -----------------------------
 # RADAR DRAWING
 # -----------------------------
 
-def draw_radar(aircraft):
+def draw_radar(aircraft, api_status="waiting", cache_age_seconds=None, last_update_time=None):
     img = Image.new("RGB", (WIDTH, HEIGHT), COLOR_BG)
     draw = ImageDraw.Draw(img)
 
+    # Radar screen background.
+    draw.rectangle((RADAR_LEFT, RADAR_TOP, RADAR_LEFT + RADAR_SIZE, RADAR_TOP + RADAR_SIZE), fill=COLOR_BG)
+
     # Main radar circle.
     draw.ellipse(
-        (
-            CENTER_X - RADAR_RADIUS,
-            CENTER_Y - RADAR_RADIUS,
-            CENTER_X + RADAR_RADIUS,
-            CENTER_Y + RADAR_RADIUS,
-        ),
+        (CENTER_X - RADAR_RADIUS, CENTER_Y - RADAR_RADIUS, CENTER_X + RADAR_RADIUS, CENTER_Y + RADAR_RADIUS),
         outline=COLOR_RING_MAJOR,
         width=scaled(2),
     )
 
     # Range rings.
-    ring_fracs = [0.50, 0.75]
-
-    for frac in ring_fracs:
+    for frac in (0.25, 0.50, 0.75):
         rr = int(RADAR_RADIUS * frac)
-        ring_range = int(RANGE_MI * frac)
+        draw.ellipse((CENTER_X - rr, CENTER_Y - rr, CENTER_X + rr, CENTER_Y + rr), outline=COLOR_RING_MINOR, width=scaled(1))
 
-        draw.ellipse(
-            (CENTER_X - rr, CENTER_Y - rr, CENTER_X + rr, CENTER_Y + rr),
-            outline=COLOR_RING_MINOR,
-            width=scaled(1),
-        )
-
-       
     # Crosshairs.
-    draw.line(
-        (CENTER_X, CENTER_Y - RADAR_RADIUS, CENTER_X, CENTER_Y + RADAR_RADIUS),
-        fill=COLOR_RING_MINOR,
-    )
-    draw.line(
-        (CENTER_X - RADAR_RADIUS, CENTER_Y, CENTER_X + RADAR_RADIUS, CENTER_Y),
-        fill=COLOR_RING_MINOR,
-    )
+    draw.line((CENTER_X, CENTER_Y - RADAR_RADIUS, CENTER_X, CENTER_Y + RADAR_RADIUS), fill=COLOR_RING_MINOR, width=scaled(1))
+    draw.line((CENTER_X - RADAR_RADIUS, CENTER_Y, CENTER_X + RADAR_RADIUS, CENTER_Y), fill=COLOR_RING_MINOR, width=scaled(1))
 
-    # Cardinal direction labels.
-    draw_centered_text(draw, "N", CENTER_X, scaled(4), FONT_BOLD, COLOR_TEXT)
-    draw_centered_text(draw, "S", CENTER_X, HEIGHT - scaled(29), FONT_MED, COLOR_TEXT)
-    draw.text((WIDTH - scaled(18), CENTER_Y - scaled(7)), "E", fill=COLOR_TEXT, font=FONT_MED)
-    draw.text((scaled(7), CENTER_Y - scaled(7)), "W", fill=COLOR_TEXT, font=FONT_MED)
+    # Cardinal labels.
+    draw_centered_text(draw, "N", CENTER_X, CENTER_Y - RADAR_RADIUS - scaled(34), FONT_BOLD, COLOR_TEXT)
+    draw_centered_text(draw, "S", CENTER_X, CENTER_Y + RADAR_RADIUS + scaled(8), FONT_BOLD, COLOR_TEXT)
+    draw.text((CENTER_X + RADAR_RADIUS + scaled(10), CENTER_Y - scaled(16)), "E", fill=COLOR_TEXT, font=FONT_BOLD)
+    draw.text((CENTER_X - RADAR_RADIUS - scaled(32), CENTER_Y - scaled(16)), "W", fill=COLOR_TEXT, font=FONT_BOLD)
 
-    # Radar range label.
-    draw.text(
-        (scaled(8), HEIGHT - scaled(17)),
-        f"Range: {RANGE_MI:g} mi",
-        fill=COLOR_TEXT_DIM,
-        font=FONT_SMALL,
-    )
-    
+    # Range label on edge of the outer circle.
+    draw.text((CENTER_X + RADAR_RADIUS - scaled(60), CENTER_Y - scaled(16)), f"{RANGE_MI:g}mi", fill=COLOR_TEXT_DIM, font=FONT_SMALL)
+
     # Own location / center dot.
-    draw.ellipse(
-        (CENTER_X - scaled(3), CENTER_Y - scaled(3), CENTER_X + scaled(3), CENTER_Y + scaled(3)),
-        fill=COLOR_OWN_SHIP,
-    )
-
-    
+    draw.ellipse((CENTER_X - scaled(4), CENTER_Y - scaled(4), CENTER_X + scaled(4), CENTER_Y + scaled(4)), fill=COLOR_OWN_SHIP)
 
     plotted = 0
     labeled = 0
@@ -638,65 +554,62 @@ def draw_radar(aircraft):
     for ac in aircraft:
         lat = ac.get("lat")
         lon = ac.get("lon")
-
         if lat is None or lon is None:
             continue
 
-        # For testing, do not hide ground aircraft.
-        # Uncomment later if you want to hide them.
-        # if ac.get("gnd") is True:
-        #     continue
-
         distance = haversine_mi(CENTER_LAT, CENTER_LON, lat, lon)
-
         if distance > RANGE_MI:
             continue
 
         bearing = bearing_deg(CENTER_LAT, CENTER_LON, lat, lon)
         x, y = polar_to_screen(distance, bearing, RANGE_MI)
-
         track = get_aircraft_heading(ac)
+
         draw_aircraft_symbol(draw, x, y, track)
 
-        callsign = get_callsign(ac)
-        aircraft_type = get_aircraft_type(ac)
-        altitude = format_altitude(ac)
-
-        # Label only first several targets to avoid clutter.
-        if labeled < 8:
-            draw_aircraft_label(draw, x, y, callsign, aircraft_type, altitude, labeled)
+        if labeled < 10:
+            draw_aircraft_label(
+                draw,
+                x,
+                y,
+                get_callsign(ac),
+                get_aircraft_type(ac),
+                format_altitude(ac),
+                labeled,
+            )
             labeled += 1
 
         plotted += 1
+
+    draw_sidebar(draw, plotted, len(aircraft), api_status, cache_age_seconds, last_update_time)
 
     return img, plotted
 
 
 # -----------------------------
-# DISPLAY OUTPUT
+# HDMI OUTPUT
 # -----------------------------
 
 def init_hdmi_display():
-    """
-    Open the active HDMI desktop display using pygame.
-    This is only used when launched with --display hdmi.
-    """
-    if DISPLAY_MODE != "hdmi":
-        return None
+    # Let `python3 radar.py --display hdmi` work from SSH without prefixing DISPLAY=:0.
+    os.environ.setdefault("DISPLAY", ":0")
+
+    if "XAUTHORITY" not in os.environ:
+        xauthority = os.path.join(os.path.expanduser("~"), ".Xauthority")
+        if os.path.exists(xauthority):
+            os.environ["XAUTHORITY"] = xauthority
 
     try:
         import pygame
     except ImportError as exc:
-        raise SystemExit(
-            "pygame is required for HDMI mode. Install it with: sudo apt install python3-pygame"
-        ) from exc
+        raise SystemExit("pygame is required. Install it with: sudo apt install python3-pygame") from exc
 
     pygame.init()
     pygame.display.set_caption("Plane Radar Pi")
     pygame.mouse.set_visible(False)
 
     if ARGS.windowed:
-        screen = pygame.display.set_mode((960, 960), pygame.RESIZABLE)
+        screen = pygame.display.set_mode((1280, 720), pygame.RESIZABLE)
     else:
         screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
 
@@ -704,14 +617,6 @@ def init_hdmi_display():
 
 
 def show_on_hdmi(img, hdmi):
-    """
-    Show the Pillow radar image on the HDMI desktop.
-    Show the radar at native HDMI resolution.
-    If the image already matches the target square, no scaling is done.
-    """
-    if DISPLAY_MODE != "hdmi" or hdmi is None:
-        return False
-
     pygame, screen = hdmi
 
     for event in pygame.event.get():
@@ -721,73 +626,27 @@ def show_on_hdmi(img, hdmi):
             raise KeyboardInterrupt
 
     screen_width, screen_height = screen.get_size()
-    scale_size = min(screen_width, screen_height)
 
-    surface = pygame.image.fromstring(img.convert("RGB").tobytes(), img.size, "RGB")
-    if img.size != (scale_size, scale_size):
-        surface = pygame.transform.smoothscale(surface, (scale_size, scale_size))
+    # If a window was resized, reconfigure and caller will draw correct size on next loop.
+    if img.size != (screen_width, screen_height):
+        surface = pygame.image.fromstring(img.convert("RGB").tobytes(), img.size, "RGB")
+        surface = pygame.transform.smoothscale(surface, (screen_width, screen_height))
+    else:
+        surface = pygame.image.fromstring(img.convert("RGB").tobytes(), img.size, "RGB")
 
-    screen.fill(COLOR_BG)
-    x = (screen_width - scale_size) // 2
-    y = (screen_height - scale_size) // 2
-    screen.blit(surface, (x, y))
+    screen.blit(surface, (0, 0))
     pygame.display.flip()
 
-    return True
-
-
-def image_to_rgb565_bytes(img):
-    """
-    Convert a Pillow RGB image to RGB565 little-endian bytes.
-
-    Most small SPI framebuffer displays on Raspberry Pi use RGB565.
-    """
-    img = img.convert("RGB")
-    rgb = img.tobytes()
-
-    output = bytearray()
-
-    for i in range(0, len(rgb), 3):
-        r = rgb[i]
-        g = rgb[i + 1]
-        b = rgb[i + 2]
-
-        value = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
-
-        # Little-endian RGB565
-        output.append(value & 0xFF)
-        output.append((value >> 8) & 0xFF)
-
-    return bytes(output)
 
 def save_preview_image(img):
-    """
-    Save a PNG copy of the radar image so it can be copied to another computer.
-    """
     if not SAVE_PREVIEW:
         return
 
     preview_dir = os.path.dirname(PREVIEW_FILE)
-
     if preview_dir:
         os.makedirs(preview_dir, exist_ok=True)
 
     img.save(PREVIEW_FILE)
-
-
-def show_on_display(img):
-    """
-    Write the radar image directly to the Linux framebuffer.
-
-    This avoids the flicker caused by repeatedly launching fbi.
-    """
-    if not WRITE_FRAMEBUFFER:
-        return
-
-    frame = image_to_rgb565_bytes(img)
-
-    with open(FRAMEBUFFER, "wb", buffering=0) as fb:
-        fb.write(frame)
 
 
 # -----------------------------
@@ -795,61 +654,95 @@ def show_on_display(img):
 # -----------------------------
 
 def main():
-    print("Starting Plane Radar Pi...")
+    print("Starting Plane Radar Pi HDMI Edition...")
     print(f"Center: {CENTER_LAT}, {CENTER_LON}")
     print(f"Range: {RANGE_MI} mi")
-    print(f"Display mode: {DISPLAY_MODE}")
-    print(f"Framebuffer device: {FRAMEBUFFER}")
-    print(f"Write framebuffer: {WRITE_FRAMEBUFFER}")
-    print(f"Save preview: {SAVE_PREVIEW}")
-    if SAVE_PREVIEW:
-        print(f"Preview file: {PREVIEW_FILE}")
-    print(f"Heading lines: {SHOW_HEADING_LINES}")
+    print(f"Screen refresh: {REFRESH_SECONDS}s")
+    print(f"API poll interval: {API_POLL_SECONDS}s minimum")
+    print(f"HDMI DISPLAY: {os.environ.get('DISPLAY', ':0')}")
     print("Press Ctrl+C to stop. Press Esc or q to quit HDMI mode.")
 
     hdmi = init_hdmi_display()
-
-    if DISPLAY_MODE == "hdmi" and hdmi is not None:
-        _, screen = hdmi
-        screen_width, screen_height = screen.get_size()
-        radar_size = min(screen_width, screen_height)
-        configure_layout(radar_size, radar_size, mode="hdmi")
-        print(f"HDMI screen: {screen_width}x{screen_height}")
-        print(f"HDMI radar render size: {WIDTH}x{HEIGHT}")
-    else:
-        configure_layout(240, 240, mode="framebuffer")
+    _, screen = hdmi
+    screen_width, screen_height = screen.get_size()
+    configure_layout(screen_width, screen_height)
+    print(f"HDMI screen: {screen_width}x{screen_height}")
+    print(f"Radar area: {RADAR_SIZE}x{RADAR_SIZE} | Sidebar: {SIDEBAR_W}px wide")
 
     last_good_aircraft = []
     last_good_fetch_time = None
+    next_api_fetch_time = 0
+    api_status = "waiting"
+    api_count = 0
 
     while True:
-        fetched_aircraft = fetch_aircraft()
+        loop_start = time.time()
 
-        if fetched_aircraft is not None:
-            last_good_aircraft = fetched_aircraft
-            last_good_fetch_time = time.time()
-            aircraft = fetched_aircraft
-            using_cached_data = False
+        # Support window resizing in --windowed mode.
+        current_width, current_height = screen.get_size()
+        if current_width != WIDTH or current_height != HEIGHT:
+            configure_layout(current_width, current_height)
+
+        # Only call the ADS-B API when the scheduler says it is time.
+        # Screen redraws can happen more often without creating API traffic.
+        if loop_start >= next_api_fetch_time:
+            result = fetch_aircraft()
+
+            if result["ok"]:
+                last_good_aircraft = result["aircraft"]
+                last_good_fetch_time = loop_start
+                api_status = "live"
+                api_count = len(last_good_aircraft)
+                next_api_fetch_time = loop_start + API_POLL_SECONDS
+            else:
+                if last_good_fetch_time is None:
+                    api_status = "waiting"
+                else:
+                    api_status = "cached"
+
+                # Back off harder after a rate limit. Honor Retry-After if present.
+                retry_after = result.get("retry_after")
+                if retry_after is not None:
+                    wait_seconds = max(API_POLL_SECONDS, retry_after)
+                elif "429" in result.get("message", ""):
+                    wait_seconds = max(API_POLL_SECONDS * 2, 30)
+                else:
+                    wait_seconds = API_POLL_SECONDS
+
+                next_api_fetch_time = loop_start + wait_seconds
+                print(f"Next API fetch in {int(wait_seconds)}s")
         else:
-            aircraft = last_good_aircraft
-            using_cached_data = True
+            if last_good_fetch_time is not None and api_status != "live":
+                api_status = "cached"
 
-        img, plotted = draw_radar(aircraft)
+        aircraft = last_good_aircraft
+        cache_age = None if last_good_fetch_time is None else int(time.time() - last_good_fetch_time)
+
+        # Show LIVE only briefly after a successful fetch; otherwise show cached age.
+        visible_status = api_status
+        if last_good_fetch_time is not None and time.time() - last_good_fetch_time > 3:
+            visible_status = "cached"
+
+        img, plotted = draw_radar(
+            aircraft,
+            api_status=visible_status,
+            cache_age_seconds=cache_age,
+            last_update_time=last_good_fetch_time,
+        )
 
         save_preview_image(img)
         show_on_hdmi(img, hdmi)
-        show_on_display(img)
 
-        if using_cached_data:
-            if last_good_fetch_time is None:
-                print(f"Plotted targets: {plotted} using cached data: no successful fetch yet")
-            else:
-                cache_age = int(time.time() - last_good_fetch_time)
-                print(f"Plotted targets: {plotted} using cached data: {cache_age}s old")
+        seconds_until_api = max(0, int(next_api_fetch_time - time.time()))
+        if visible_status == "cached":
+            print(f"Plotted targets: {plotted} using cached data: {cache_age}s old | next API fetch in {seconds_until_api}s")
+        elif visible_status == "waiting":
+            print(f"Plotted targets: {plotted} waiting for first successful API fetch | next API fetch in {seconds_until_api}s")
         else:
-            print(f"Plotted targets: {plotted}")
+            print(f"Plotted targets: {plotted} | next API fetch in {seconds_until_api}s")
 
-        time.sleep(REFRESH_SECONDS)
+        elapsed = time.time() - loop_start
+        time.sleep(max(0.1, REFRESH_SECONDS - elapsed))
 
 
 if __name__ == "__main__":
