@@ -2,6 +2,7 @@
 
 import argparse
 import configparser
+import json
 import math
 import os
 import socket
@@ -43,7 +44,10 @@ def load_config():
         "center_lon": "-95.39204791784302",
         "range_mi": "10",
         "refresh_seconds": "1",
-        "api_poll_seconds": "15",
+        "api_poll_seconds": "60",
+        "minimum_api_poll_seconds": "15",
+        "max_backoff_seconds": "300",
+        "cache_file": "/tmp/plane-radar-aircraft-cache.json",
     }
 
     config["display"] = {
@@ -64,10 +68,15 @@ def load_config():
         "center_lat": radar_config.getfloat("center_lat"),
         "center_lon": radar_config.getfloat("center_lon"),
         "range_mi": radar_config.getfloat("range_mi"),
-        # refresh_seconds is now the screen redraw interval.
-        # api_poll_seconds controls how often the ADS-B API is called.
+        # refresh_seconds is the screen redraw interval.
+        # api_poll_seconds is the requested ADS-B API interval.
+        # minimum_api_poll_seconds is a visible safety floor.
+        # Effective API interval = max(api_poll_seconds, minimum_api_poll_seconds).
         "refresh_seconds": max(1, radar_config.getint("refresh_seconds", fallback=1)),
-        "api_poll_seconds": max(15, radar_config.getint("api_poll_seconds", fallback=radar_config.getint("refresh_seconds", fallback=15))),
+        "requested_api_poll_seconds": max(1, radar_config.getint("api_poll_seconds", fallback=60)),
+        "minimum_api_poll_seconds": max(1, radar_config.getint("minimum_api_poll_seconds", fallback=15)),
+        "max_backoff_seconds": max(60, radar_config.getint("max_backoff_seconds", fallback=300)),
+        "cache_file": radar_config.get("cache_file", fallback="/tmp/plane-radar-aircraft-cache.json"),
         "save_preview": display_config.getboolean("save_preview"),
         "preview_file": display_config.get("preview_file"),
         "show_heading_lines": display_config.getboolean("show_heading_lines"),
@@ -84,7 +93,11 @@ CENTER_LAT = APP_CONFIG["center_lat"]
 CENTER_LON = APP_CONFIG["center_lon"]
 RANGE_MI = APP_CONFIG["range_mi"]
 REFRESH_SECONDS = APP_CONFIG["refresh_seconds"]
-API_POLL_SECONDS = APP_CONFIG["api_poll_seconds"]
+REQUESTED_API_POLL_SECONDS = APP_CONFIG["requested_api_poll_seconds"]
+MINIMUM_API_POLL_SECONDS = APP_CONFIG["minimum_api_poll_seconds"]
+API_POLL_SECONDS = max(REQUESTED_API_POLL_SECONDS, MINIMUM_API_POLL_SECONDS)
+MAX_BACKOFF_SECONDS = APP_CONFIG["max_backoff_seconds"]
+CACHE_FILE = APP_CONFIG["cache_file"]
 SAVE_PREVIEW = APP_CONFIG["save_preview"]
 PREVIEW_FILE = APP_CONFIG["preview_file"]
 SHOW_HEADING_LINES = APP_CONFIG["show_heading_lines"]
@@ -237,6 +250,40 @@ def polar_to_screen(distance_mi, bearing, max_range_mi):
     y = CENTER_Y - math.cos(angle) * radius
     return int(x), int(y)
 
+
+
+# -----------------------------
+# AIRCRAFT CACHE
+# -----------------------------
+
+def load_aircraft_cache():
+    """Load the last good aircraft list from disk so restarts do not start blank."""
+    try:
+        if not os.path.exists(CACHE_FILE):
+            return [], None
+        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        aircraft = payload.get("aircraft", [])
+        fetched_at = payload.get("fetched_at")
+        if not isinstance(aircraft, list):
+            return [], None
+        print(f"Loaded cached aircraft from {CACHE_FILE}: {len(aircraft)} aircraft")
+        return aircraft, fetched_at
+    except Exception as e:
+        print(f"Could not load aircraft cache: {e}")
+        return [], None
+
+
+def save_aircraft_cache(aircraft, fetched_at):
+    """Persist the last successful API result."""
+    try:
+        cache_dir = os.path.dirname(CACHE_FILE)
+        if cache_dir:
+            os.makedirs(cache_dir, exist_ok=True)
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"fetched_at": fetched_at, "aircraft": aircraft}, f)
+    except Exception as e:
+        print(f"Could not save aircraft cache: {e}")
 
 # -----------------------------
 # ADS-B DATA
@@ -658,7 +705,11 @@ def main():
     print(f"Center: {CENTER_LAT}, {CENTER_LON}")
     print(f"Range: {RANGE_MI} mi")
     print(f"Screen refresh: {REFRESH_SECONDS}s")
-    print(f"API poll interval: {API_POLL_SECONDS}s minimum")
+    print(f"Requested API poll interval: {REQUESTED_API_POLL_SECONDS}s")
+    print(f"Minimum API poll interval: {MINIMUM_API_POLL_SECONDS}s")
+    print(f"Effective API poll interval: {API_POLL_SECONDS}s")
+    print(f"Max API backoff: {MAX_BACKOFF_SECONDS}s")
+    print(f"Aircraft cache: {CACHE_FILE}")
     print(f"HDMI DISPLAY: {os.environ.get('DISPLAY', ':0')}")
     print("Press Ctrl+C to stop. Press Esc or q to quit HDMI mode.")
 
@@ -669,11 +720,12 @@ def main():
     print(f"HDMI screen: {screen_width}x{screen_height}")
     print(f"Radar area: {RADAR_SIZE}x{RADAR_SIZE} | Sidebar: {SIDEBAR_W}px wide")
 
-    last_good_aircraft = []
-    last_good_fetch_time = None
+    last_good_aircraft, last_good_fetch_time = load_aircraft_cache()
     next_api_fetch_time = 0
-    api_status = "waiting"
-    api_count = 0
+    api_status = "cached" if last_good_aircraft else "waiting"
+    api_count = len(last_good_aircraft)
+    consecutive_429s = 0
+    consecutive_failures = 0
 
     while True:
         loop_start = time.time()
@@ -693,6 +745,9 @@ def main():
                 last_good_fetch_time = loop_start
                 api_status = "live"
                 api_count = len(last_good_aircraft)
+                consecutive_429s = 0
+                consecutive_failures = 0
+                save_aircraft_cache(last_good_aircraft, last_good_fetch_time)
                 next_api_fetch_time = loop_start + API_POLL_SECONDS
             else:
                 if last_good_fetch_time is None:
@@ -700,14 +755,21 @@ def main():
                 else:
                     api_status = "cached"
 
-                # Back off harder after a rate limit. Honor Retry-After if present.
+                # Back off aggressively after rate limits. This prevents hammering the API
+                # while the public service is still cooling down our IP address.
+                message = result.get("message", "")
                 retry_after = result.get("retry_after")
-                if retry_after is not None:
-                    wait_seconds = max(API_POLL_SECONDS, retry_after)
-                elif "429" in result.get("message", ""):
-                    wait_seconds = max(API_POLL_SECONDS * 2, 30)
+
+                if "429" in message:
+                    consecutive_429s += 1
+                    consecutive_failures += 1
+                    exponential_wait = API_POLL_SECONDS * (2 ** min(consecutive_429s, 4))
+                    wait_seconds = min(MAX_BACKOFF_SECONDS, max(API_POLL_SECONDS, exponential_wait))
+                    if retry_after is not None:
+                        wait_seconds = max(wait_seconds, retry_after)
                 else:
-                    wait_seconds = API_POLL_SECONDS
+                    consecutive_failures += 1
+                    wait_seconds = min(MAX_BACKOFF_SECONDS, max(API_POLL_SECONDS, API_POLL_SECONDS * consecutive_failures))
 
                 next_api_fetch_time = loop_start + wait_seconds
                 print(f"Next API fetch in {int(wait_seconds)}s")
